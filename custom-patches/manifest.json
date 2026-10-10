@@ -3,9 +3,9 @@
   "upstream_branch": "dev",
   "base_commit": "05a013b29da78cf2321b9b46ec5039dde2fb0bb0",
   "patch_set": "runtime-pp-exp30-preserved-20261010",
-  "status": "preserved-runtime-overlay-not-a-release",
-  "companion_vllm_branch": "feature-runtime-pp-exp30-preserved-20261010",
-  "validation": "All 44 LMCache files match the recorded exp30 installed-source hashes; Python syntax checked. Full package build and runtime tests not rerun. Local source workspaces remain separately preserved.",
+  "status": "integrated-image-candidate",
+  "companion_vllm_branch": "feature-runtime-v026-lmc055",
+  "validation": "Source hashes matched the pinned exp30 runtime; image rebuild and targeted validation recorded separately. No new model replay implied.",
   "files": [
     {
       "path": "lmcache/integration/vllm/kubernetes_pp.py",
@@ -191,5 +191,7 @@
     "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py": "fd3ecce636875b04186aba20126bc803cc37b0f622a45785e3ed52c40f0b491f",
     "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py": "463847b039734798d699fb8bbef91baaf54e994b434a320474188caa0286313a",
     "vllm/v1/core/sched/scheduler.py": "ed3516d212f07fca6003ffe1c9b41d41734ed8231f3b8f33c90aaa311f747a4c"
-  }
+  },
+  "branch": "feature-runtime-v026-lmc055",
+  "companion_branch": "feature-runtime-v026-lmc055"
 }
