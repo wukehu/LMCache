@@ -323,7 +323,8 @@ def send_ping(
             liveness, or None for an untracked prober (scheduler adapter).
 
     Returns:
-        True if server is healthy, False on timeout or error.
+        True if the server recognizes the worker (or an untracked probe succeeds);
+        False for missing registration, timeout or error.
     """
     try:
         future = req_client.ping(instance_id)
@@ -518,7 +519,7 @@ class HeartbeatThread(PeriodicThread):
         self._recover_callback: Callable[[], bool] = noop
 
     def register_recover_callback(self, callback: Callable[[], bool]) -> None:
-        """Register a callback fired on the unhealthy->healthy transition.
+        """Register a callback for restored reachability or missing registration.
 
         The callback runs **before** the health event is set. It must
         return ``True`` on success (event will be set) or ``False`` on
@@ -557,12 +558,22 @@ class HeartbeatThread(PeriodicThread):
                 message="stop requested; skipping health update",
             )
 
+        registration_missing = False
+        if not healthy and self._instance_id is not None:
+            # A reachable server can have lost this worker's registration even
+            # when no heartbeat observed downtime (a fast restart or reaping).
+            registration_missing = send_ping(
+                self._req_client, timeout=self._interval, instance_id=None
+            )
+        if self.stop_requested:
+            return ThreadRunSummary(success=True, message="stop requested")
         need_trigger_recover = (
-            healthy and not was_healthy and self._recover_callback is not None
-        )
+            (healthy and not was_healthy) or registration_missing
+        ) and self._recover_callback is not None
 
         # Try to call recover callback
         if need_trigger_recover:
+            self._health_event.clear()
             logger.warning(
                 "LMCache server is healthy again, triggering recovery callback"
             )
@@ -1574,6 +1585,8 @@ class LMCacheMPWorkerAdapter:
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
         self._send_register_kv_caches_request(kv_caches)
+        # Idle registered workers must also detect MP restarts.
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1625,14 +1638,14 @@ class LMCacheMPWorkerAdapter:
             ) from None
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start the heartbeat after registration; repeated calls are idempotent.
 
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
         ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        is needed at startup, and the first store/retrieve is not gated.
+        The callback re-registers after restored reachability or when a live
+        server reports that this worker is no longer registered.
         """
         if self._heartbeat is not None:
             return
@@ -1743,6 +1756,8 @@ class LMCacheMPWorkerAdapter:
         non-writer rank, or a drop while the server is unhealthy) reports
         completion immediately, because the scheduler unpins the request's
         blocks only after collecting one receipt per worker rank.
+        In eager mode, skipped stores also retain a completion receipt until
+        the engine finishes the request and releases its blocks.
 
         Args:
             request_id: The ID of the request
@@ -1759,6 +1774,8 @@ class LMCacheMPWorkerAdapter:
             # Non-writer ranks (MLA) never store anything.
             if self.lazy_offload:
                 self._completed_store_requests[request_id] = 1
+            else:
+                self.finished_stores.add(request_id)
             return
 
         if not self.is_healthy:
@@ -1771,6 +1788,8 @@ class LMCacheMPWorkerAdapter:
                 )
                 self._completed_store_requests[request_id] = 1
                 self._failed_store_requests.add(request_id)
+            else:
+                self.finished_stores.add(request_id)
             return
 
         assert op.token_ids is not None
@@ -1965,7 +1984,7 @@ class LMCacheMPWorkerAdapter:
         finished_req_ids_from_lmcache: set[str],
         finished_req_ids_from_engine: set[str],
     ) -> set[str]:
-        """Merge LMCache-side and engine-side finished store info."""
+        """Report completion only for requests that had a STORE operation."""
         self.finished_stores.update(finished_req_ids_from_lmcache)
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
@@ -1973,8 +1992,6 @@ class LMCacheMPWorkerAdapter:
                 continue
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
-            else:
-                ret_stores.add(req_id)
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
         return ret_stores
@@ -2088,10 +2105,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_events.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
-        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
-        # finished_sending dedup is needed (unlike the unhealthy branch): a
-        # dropped retrieve's request is parked in WAITING_FOR_REMOTE_KVS until
-        # this report, so it cannot also be engine-finished in the same call.
+        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         # Swap-drain so a concurrent submit_retrieve_request add is never lost.
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
@@ -2101,10 +2115,13 @@ class LMCacheMPWorkerAdapter:
         ret_stores = self._process_finished_stores(
             finished_stores, finished_req_ids_from_engine
         )
+        # A failed retrieve can finish in the same step as the engine request.
+        # The scheduler releases finished requests on the receive notification;
+        # reporting a send completion too would release the request twice.
+        ret_stores -= finished_retrieves
 
         # the invocation of `get_finished` means that
-        # these requests' KV caches are already fully stored.
-        # or the requests normally ends without any store.
+        # these requests' STORE operations have completed or been dropped.
         if ret_stores:
             self.request_telemetry.on_request_store_finished(
                 request_ids_set=ret_stores,

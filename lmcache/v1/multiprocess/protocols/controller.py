@@ -47,7 +47,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Ping
         # Payload: [instance_id] -- the sender's worker instance ID, or None
         #   for an untracked prober (the scheduler adapter).
-        # Returns: bool - Always True
+        # Returns: bool - live untracked prober or a registered worker
         # BLOCKING on the NORMAL pool: keeps PING off the MQ main loop (where a
         # slow SYNC REGISTER_KV_CACHE would stall it) and lets pool saturation
         # surface as worker degraded mode.

@@ -113,12 +113,16 @@ class ManagementModule:
                 worker's last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            True for an untracked prober, or if a target recognizes the worker.
+            False when the worker must register again (for example after restart).
         """
-        if instance_id is not None:
-            for target in self._liveness_targets:
-                target.touch_instance(instance_id)
-        return True
+        if instance_id is None:
+            return True
+        registered = False
+        for target in self._liveness_targets:
+            # Refresh every target, even after one has recognized the instance.
+            registered = target.touch_instance(instance_id) or registered
+        return registered
 
     def _reap_cycle(self) -> ThreadRunSummary:
         """Run one reaper scan: reap stale workers, drop mirrored state.

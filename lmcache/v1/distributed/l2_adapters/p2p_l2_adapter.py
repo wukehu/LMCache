@@ -166,6 +166,7 @@ class P2PL2Adapter(L2AdapterInterface):
         self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
 
         self._closed = False
+        self._transfer_failed = False
 
     # --------------------
     # Event Fd Interface
@@ -219,7 +220,7 @@ class P2PL2Adapter(L2AdapterInterface):
         task_id = self._next_task_id
         self._next_task_id += 1
 
-        if self._closed:
+        if self._closed or self._transfer_failed:
             self._lookup_tasks[task_id] = _LookupTask(
                 keys=keys, remote_task_id=-1, deadline=0.0, failed=True
             )
@@ -311,10 +312,18 @@ class P2PL2Adapter(L2AdapterInterface):
         local_addresses = self._tc_context.get_transfer_channel_address(
             [(obj.shm_offset, obj.shm_byte_length) for obj in objects]
         )
-        read_task_id = self._tc_client.submit_read(
-            local_addresses,
-            remote_addresses,  # type: ignore
-        )
+        try:
+            read_task_id = self._tc_client.submit_read(
+                local_addresses,
+                remote_addresses,  # type: ignore
+            )
+        except Exception:
+            self._transfer_failed = True
+            logger.exception("P2P load task %d submission failed", task_id)
+            self._load_tasks[task_id] = _LoadTask(
+                keys=keys, read_task_id=-1, deadline=0.0, failed=True
+            )
+            return task_id
 
         self._load_tasks[task_id] = _LoadTask(
             keys=keys,
@@ -330,18 +339,31 @@ class P2PL2Adapter(L2AdapterInterface):
         if task.failed:
             del self._load_tasks[task_id]
             return Bitmap(len(task.keys))
-        if time.monotonic() > task.deadline:
-            del self._load_tasks[task_id]
-            logger.warning("P2P load task %d timed out; treating as a failure", task_id)
-            return Bitmap(len(task.keys))
+        timed_out = time.monotonic() > task.deadline
+        if timed_out:
+            if not self._transfer_failed:
+                logger.warning(
+                    "P2P load task %d timed out; waiting for transfer drain", task_id
+                )
+            self._transfer_failed = True
 
-        result = self._tc_client.query_read_status(task.read_task_id)
+        try:
+            result = self._tc_client.query_read_status(task.read_task_id)
+        except Exception:
+            self._transfer_failed = True
+            logger.exception("P2P load task %d query failed", task_id)
+            # An observation failure does not prove DMA has stopped. Retain
+            # the task and its caller-owned buffers until a terminal result.
+            return None
         if not result.is_finished():
             return None
 
+        if not all(result.succeeded_mask):
+            self._transfer_failed = True
+
         bitmap = Bitmap(len(task.keys))
         for i, succeeded in enumerate(result.succeeded_mask):
-            if succeeded:
+            if succeeded and not timed_out:
                 bitmap.set(i)
         del self._load_tasks[task_id]
         return bitmap
@@ -369,7 +391,7 @@ class P2PL2Adapter(L2AdapterInterface):
 
     def report_status(self) -> dict:
         return {
-            "is_healthy": True,
+            "is_healthy": not self._transfer_failed,
             "type": "P2PL2Adapter",
             "peer_mq_server_url": self._config.peer_mq_server_url,
             "peer_transfer_channel_server_url": (

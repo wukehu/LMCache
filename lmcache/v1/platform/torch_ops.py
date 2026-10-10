@@ -2293,33 +2293,26 @@ def lmcache_memcpy_async(
     direction: TransferDirection,
     host_buffer_offset: int,
     host_buffer_alignments: int,
-):
-    """
-    Python fallback for lmcache_memcpy_async.
+) -> None:
+    """Copy host/device bytes in the current accelerator stream.
 
-    - Tensor mode (non-CUDA devices like HPU): uses .to(device) + copy_()
-    - Pointer mode with libcudart: uses synchronous cudaMemcpy (cudaMemcpyDefault)
-    - Pointer mode without libcudart: uses CPU tensor copy
+    Pointer mode enqueues CUDA copies on the calling thread's current stream,
+    splitting at host registration boundaries. Tensor mode uses Torch copies;
+    CPU-only pointer mode copies host bytes directly. The caller must retain
+    both buffers until the stream completes before consuming or reusing them.
 
-    Unlike the C++ version (which uses cudaMemcpyAsync and must split copies
-    at cudaHostRegister boundaries), this Python fallback does NOT need
-    alignment-based chunking because:
-    - cudaMemcpy (synchronous) handles cross-cudaHostRegister boundaries
-      internally via staging buffers
-    - CPU tensor copy has no alignment constraints
-    - Tensor mode bypasses raw pointers entirely
+    Args:
+        dest: Destination pointer or tensor.
+        src: Source pointer or tensor; must use the same form as ``dest``.
+        nbytes: Number of bytes to copy.
+        direction: H2D or D2H transfer direction.
+        host_buffer_offset: Byte offset within the registered host arena.
+        host_buffer_alignments: Power-of-two host registration interval.
 
-    dest:
-        - If int: raw memory pointer (used for CUDA/CPU devices where we
-          work with pointers).
-        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices
-          where we operate on tensor objects directly).
-
-    src:
-        - If int: raw memory pointer (used for CUDA/CPU devices where we
-          work with pointers).
-        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices
-          where we operate on tensor objects directly).
+    Raises:
+        ValueError: Invalid alignment, direction, or tensor byte count.
+        TypeError: Source and destination use incompatible representations.
+        RuntimeError: The CUDA copy could not be enqueued.
     """
     # 1. Power of two check (kept for API compatibility)
     if host_buffer_alignments <= 0 or (
@@ -2358,21 +2351,38 @@ def lmcache_memcpy_async(
             "or both torch.Tensor (tensor mode)"
         )
 
-    libcudart = _get_copy_lib()
-    if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
-        try:
-            # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
-            # internally — no manual alignment splitting needed.
-            ret = libcudart.cudaMemcpy(
-                ctypes.c_void_p(dest),
-                ctypes.c_void_p(src),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_int(4),  # cudaMemcpyDefault
+    torch_dev, device_type = get_torch_device()
+    if device_type == "cuda" and torch_dev.is_available():
+        libcudart = _get_copy_lib()
+        if libcudart is None or not hasattr(libcudart, "cudaMemcpyAsync"):
+            raise RuntimeError("CUDA pointer copies require cudaMemcpyAsync")
+        stream = torch_dev.current_stream().cuda_stream
+        memcpy = libcudart.cudaMemcpyAsync
+        memcpy.restype = ctypes.c_int
+        memcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        offset = 0
+        while offset < nbytes:
+            # A lazy arena registers each aligned host region separately.
+            remaining_in_region = host_buffer_alignments - (
+                (host_buffer_offset + offset) % host_buffer_alignments
+            )
+            copy_size = min(nbytes - offset, remaining_in_region)
+            ret = memcpy(
+                ctypes.c_void_p(dest + offset),
+                ctypes.c_void_p(src + offset),
+                ctypes.c_size_t(copy_size),
+                ctypes.c_int(4),  # cudaMemcpyDefault also supports host-only tests.
+                ctypes.c_void_p(stream),
             )
             if ret != 0:
-                raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
-        except AttributeError:
-            raise
+                raise RuntimeError(f"cudaMemcpyAsync failed with error code {ret}")
+            offset += copy_size
     else:
         # Pure CPU copy — no alignment constraints.
         _copy_bytes_with_tensor(dest, src, nbytes)

@@ -238,8 +238,8 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
 
     Exercises multiple boundary conditions to verify correct behaviour for
     both the CUDA DeviceOps backend (which chunks at alignment boundaries via
-    cudaMemcpyAsync) and the Python fallback backend (which issues a single
-    synchronous copy):
+    cudaMemcpyAsync) and the Python fallback backend (which uses the current
+    CUDA stream for pointer copies):
       - copy spanning exactly one aligned block
       - copy entirely within one aligned block (no boundary crossing)
       - copy crossing a single alignment boundary

@@ -65,6 +65,10 @@ class LMCacheMPRequestTracker:
     # requests.
     num_stored_tokens: int = 0
 
+    # Lookup hits also increase num_stored_tokens. Track actual STORE metadata
+    # separately so receive-only requests never wait for a send completion.
+    has_store_operation: bool = False
+
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
@@ -90,6 +94,7 @@ class LMCacheMPRequestTracker:
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
+        self.has_store_operation = False
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
         self.state = LMCacheMPRequestState.PREFETCHING

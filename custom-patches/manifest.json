@@ -1,0 +1,102 @@
+{
+  "upstream": "https://github.com/LMCache/LMCache",
+  "upstream_branch": "dev",
+  "base_commit": "1a4b40b1d79b0e76244f127f96ee0982f8bd270f",
+  "patch_set": "mp-runtime-preserved-20261010",
+  "status": "preserved-development-snapshot",
+  "validation": "Source hashes and Python syntax checked during migration; GPU/runtime tests not rerun. This is not a release certification.",
+  "files": [
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_connector.py",
+      "sha256": "03b6df68bdb9c816ca10671f81cb7028348099e9bb180e3b235c4dfc2c53a1c6"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_metadata.py",
+      "sha256": "8fc0616a801ee7d4bce20b03e106d4a8ad2161108a696082027d435319edd44a"
+    },
+    {
+      "path": "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+      "sha256": "b78cf8d32277bee635c789ebaa1dac98d6590b37b6fe5b4570032cd7f21f4ea3"
+    },
+    {
+      "path": "lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py",
+      "sha256": "6d4b8728865822ac90c131a6c7b7ae5312aa3737abc78540c8fe746e52fbb1e6"
+    },
+    {
+      "path": "lmcache/v1/distributed/transfer_channel/impl/nixl_impl.py",
+      "sha256": "29870c256cdbd10253d98ec01b0e09d6f6661ed03f3a28c952e8f1b66595df7e"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/engine_module.py",
+      "sha256": "1bba2b72413cb7a62ced661a8231c4e88c290bb7d9087080592177b86f5b879a"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/engine_driven_transfer.py",
+      "sha256": "c444a21f820d14b92d91d9608f317845290642c39ac2204fe96019dc02e109a8"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/experimental/qstore.py",
+      "sha256": "ab3c385facff4101c29077f500ea4ba0fd4767f851213b4fb7d789b0d71c6a34"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py",
+      "sha256": "a999d662b9579b539f44cad7c6052e50f5ca0b3ef699bf16057ad0db0dcf173d"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/management.py",
+      "sha256": "27eac87a47b9ef0bf1d98534077e608f646053e52bdf08cd031320377663cc5c"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/p2p_controller.py",
+      "sha256": "a159a96f4cbd182c2c7e3d8e57aa9ac9f1f571bc94c9ca0654226aed4b34d485"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/controller.py",
+      "sha256": "71cc4fefff993c8dcad21d535c70e87ee94e2d2eeeaf3cde2be1dec6dd854113"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transfer_context/worker_transfer.py",
+      "sha256": "a6a43d7c8f1c2b23fb101b39ccbf002503dea8052d11c7b74b0caca3f1f56d67"
+    },
+    {
+      "path": "lmcache/v1/platform/torch_ops.py",
+      "sha256": "1c812851afeab7ba313cf25f6cb51458c6aa68152ad7f162a407232ff9d6ff20"
+    },
+    {
+      "path": "tests/v1/distributed/l2_adapters/test_p2p_l2_adapter.py",
+      "sha256": "36856d2f70957ebea390c5932e27f915b229398f4c39cb16582286240fbf00b3"
+    },
+    {
+      "path": "tests/v1/distributed/transfer_channel/test_nixl_client_failure.py",
+      "sha256": "f9a24506b61498d98af9ed0d18e88f64a22fc3b18bdf013494cb84aa6f6b578c"
+    },
+    {
+      "path": "tests/v1/multiprocess/test_background_ipc_registration.py",
+      "sha256": "37482b91a3cfcb9385b057e36a741a24425774fdbf0e27ac0120848fbe18e6f5"
+    },
+    {
+      "path": "tests/v1/multiprocess/test_p2p_controller.py",
+      "sha256": "4949faabbbeb0214d08f53979bcab5702a1c71440415ffbefccfdf5bbf2f70d7"
+    },
+    {
+      "path": "tests/v1/multiprocess/test_worker_liveness.py",
+      "sha256": "18597f10bae58859f19368f4729b170be5dd916e1bc68024507d7853ac152edd"
+    },
+    {
+      "path": "tests/v1/platform/devices/cuda/test_torch_memcpy_stream.py",
+      "sha256": "3b7bc538758df1e23f10fa4fe87948847c66a718998a7deb996de923fa8ea5f4"
+    },
+    {
+      "path": "tests/v1/test_mp_connector_kv_roles.py",
+      "sha256": "4141082dd36e7f966e6482ce4511afb2aca8ae9b5510db92d777166ad7b12e89"
+    },
+    {
+      "path": "tests/v1/test_torch_ops.py",
+      "sha256": "30e33adaad78f073dc75ba924d3b6b0c4bd3b74c4efd200d25791d01e8eda130"
+    },
+    {
+      "path": "tests/v1/test_vllm_mp_adapter.py",
+      "sha256": "e0a0fee4efe7027f9b22feac60f4ff573fec62b9183d1e297e447eee5987696c"
+    }
+  ]
+}

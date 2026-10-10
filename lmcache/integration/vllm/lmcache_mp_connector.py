@@ -1014,8 +1014,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if self.lazy_offload:
             val = self.worker_adapter.get_finished_with_lazy_offload()
         else:
-            # The adapter reports engine-finished IDs even without a STORE.
-            # Consumers never delay frees for saves, but must still poll retrieves.
+            # Only requests with a STORE need send completions. Consumers still
+            # poll receives but never delay frees for saves.
             val = self.worker_adapter.get_finished(
                 finished_req_ids if self._can_store else set()
             )
@@ -1473,6 +1473,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
 
+        tracker = self.request_trackers.get(request.request_id)
+        delay_free = (
+            self._can_store and tracker is not None and tracker.has_store_operation
+        )
+
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
 
@@ -1492,7 +1497,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
-        return self._can_store, (return_params or None)
+        return delay_free, (return_params or None)
 
     def request_finished_all_groups(
         self,
@@ -1625,6 +1630,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self._group_tokens_per_block,
             )
             if r_meta is not None:
+                request_tracker.has_store_operation = True
                 # In lazy_offload mode, add to pending queue instead of immediate store
                 if self.lazy_offload:
                     self._lazy_offload_manager.add_store_candidate(r_meta)
@@ -1662,6 +1668,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
             if r_meta is not None:
+                request_tracker.has_store_operation = True
                 # In lazy_offload mode, add to pending queue instead of immediate store
                 if self.lazy_offload:
                     self._lazy_offload_manager.add_store_candidate(r_meta)

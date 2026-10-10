@@ -117,9 +117,9 @@ def test_gpu_touch_latches_get_does_not() -> None:
     assert module._cache_contexts[1].last_seen > 0.0
     assert module._cache_contexts[1].has_liveness_signal is False
 
-    module.touch_instance(1)
+    assert module.touch_instance(1) is True
     assert module._cache_contexts[1].has_liveness_signal is True
-    module.touch_instance(999)  # absent -> no error
+    assert module.touch_instance(999) is False
 
 
 def test_gpu_reap_two_tier_windows() -> None:
@@ -205,8 +205,9 @@ class _FakeTarget:
         self.dropped: list[int] = []
         self.count = 0
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool:
         self.touched.append(instance_id)
+        return True
 
     def reap_stale_instances(
         self, reap_timeout_s: float, registration_grace_s: float
@@ -346,3 +347,10 @@ def test_config_accepts_disabled_and_defaults() -> None:
     default = MPServerConfig()
     assert default.worker_reap_timeout_seconds == 120.0
     assert default.worker_registration_grace_seconds == 3600.0
+
+
+def test_ping_distinguishes_missing_registration_from_unreachable_server() -> None:
+    """A restarted server answers generic probes but rejects stale worker IDs."""
+    mgmt = ManagementModule(MagicMock())
+    assert mgmt.ping(None) is True
+    assert mgmt.ping(42) is False

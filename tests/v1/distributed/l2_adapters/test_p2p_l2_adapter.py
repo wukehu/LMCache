@@ -308,6 +308,14 @@ def test_load_deadline_expired_yields_failure():
             keys, [MagicMock(shm_offset=0, shm_byte_length=10)]
         )
         time.sleep(0.02)
+        tc_client.query_read_status.return_value = TransferChannelReadResult(
+            finished=False
+        )
+        assert adapter.query_load_result(task_id) is None
+        assert adapter.report_status()["in_flight_loads"] == 1
+        tc_client.query_read_status.return_value = TransferChannelReadResult(
+            finished=True, succeeded_mask=[True]
+        )
         bitmap = adapter.query_load_result(task_id)
         assert bitmap is not None
         assert bitmap.popcount() == 0
@@ -379,6 +387,45 @@ def test_report_status():
         assert status["peer_transfer_channel_server_url"] == "peer:7600"
         assert status["in_flight_lookups"] == 0
         assert status["in_flight_loads"] == 0
+
+
+@pytest.mark.parametrize("failure", ["submit", "query", "result"])
+def test_transfer_failure_drains_task_and_marks_adapter_unhealthy(failure: str) -> None:
+    """Failed transport cannot strand prefetch or advertise a healthy peer."""
+    keys = [_key(0)]
+    with _adapter() as (adapter, mq, _ctx, client, _notifier):
+        mq.p2p_lookup_and_lock.return_value = _FakeFuture(1)
+        mq.p2p_query_lookup_results.return_value = _FakeFuture(
+            [TransferChannelAddress(offset=100, size=10)]
+        )
+        lookup = adapter.submit_lookup_and_lock_task(keys, {})
+        assert adapter.query_lookup_and_lock_result(lookup).popcount() == 1
+        client.submit_read.return_value = 2
+        if failure == "submit":
+            client.submit_read.side_effect = RuntimeError("remote disconnected")
+        elif failure == "query":
+            client.query_read_status.side_effect = RuntimeError("remote disconnected")
+        else:
+            client.query_read_status.return_value = TransferChannelReadResult(
+                finished=True, succeeded_mask=[False]
+            )
+        task = adapter.submit_load_task(
+            keys, [MagicMock(shm_offset=0, shm_byte_length=10)]
+        )
+        if failure == "query":
+            assert adapter.query_load_result(task) is None
+            assert adapter.report_status()["in_flight_loads"] == 1
+            client.query_read_status.side_effect = None
+            client.query_read_status.return_value = TransferChannelReadResult(
+                finished=True, succeeded_mask=[False]
+            )
+        assert adapter.query_load_result(task).popcount() == 0
+        assert adapter.query_load_result(task) is None
+        assert adapter.report_status()["is_healthy"] is False
+        assert adapter.report_status()["in_flight_loads"] == 0
+        lookup = adapter.submit_lookup_and_lock_task(keys, {})
+        assert adapter.query_lookup_and_lock_result(lookup).popcount() == 0
+        mq.p2p_lookup_and_lock.assert_called_once()
 
 
 def test_close_unregisters_fds_and_closes_client():

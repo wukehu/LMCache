@@ -511,6 +511,11 @@ class LMCacheDrivenTransferContext(TransferContext):
             ValueError: If ``kv_caches`` is empty.
         """
         device = _get_kv_device(kv_caches)
+        if device.type == "cuda":
+            # Recovery runs on a heartbeat thread without a current CUDA
+            # context. A device guard may be a no-op for the same device index;
+            # set_device also initializes the context needed by IPC driver calls.
+            torch.cuda.set_device(device)
         event_backend = get_event_ipc_backend(device)
         event_backend.check_event_support(device)
 

@@ -373,6 +373,7 @@ class P2PController:
             for inst in instances
             if inst.instance_id != self._instance_id
             and inst.p2p_advertised_url
+            and inst.p2p_advertised_url != self._p2p_config.advertise_url
             and inst.ip
             and inst.mq_port
         }
@@ -461,16 +462,47 @@ class P2PController:
         """
         added = 0
         removed = 0
+        # Discovery can stay healthy after a data-plane disconnect. Reuse the
+        # normal drain/close/add lifecycle to refresh that peer's transport.
+        unhealthy = {
+            descriptor.index
+            for descriptor, adapter in self._ctx.storage_manager.l2_adapters()
+            if not adapter.report_status()["is_healthy"]
+        }
+        owners: dict[str, set[str]] = {}
         for peer_id, inst in upstream.items():
+            owners.setdefault(inst.p2p_advertised_url, set()).add(peer_id)
+        ambiguous = {url for url, ids in owners.items() if len(ids) > 1}
+
+        # Transfer clients are cached by endpoint, while adapters belong to an
+        # instance. A restarted instance can reuse an endpoint before its old
+        # registration expires. Drain the old owner before allowing reuse;
+        # never pick a process generation from an ambiguous membership view.
+        for peer_id, current in list(self._adapters.items()):
+            if owners.get(current.p2p_advertised_url, set()) - {peer_id}:
+                if self._remove_adapter(peer_id):
+                    removed += 1
+
+        for peer_id, inst in upstream.items():
+            if inst.p2p_advertised_url in ambiguous:
+                continue
+            if any(
+                other_id != peer_id
+                and other.p2p_advertised_url == inst.p2p_advertised_url
+                for other_id, other in self._adapters.items()
+            ):
+                # A previous owner's drain failed. Retry it next cycle before
+                # allocating another adapter that would share its client.
+                continue
             current = self._adapters.get(peer_id)
             if current is None:
                 if self._add_adapter(inst):
                     added += 1
-            elif self._peer_changed(current, inst):
-                self._remove_adapter(peer_id)
-                removed += 1
-                if self._add_adapter(inst):
-                    added += 1
+            elif self._peer_changed(current, inst) or current.adapter_id in unhealthy:
+                if self._remove_adapter(peer_id):
+                    removed += 1
+                    if self._add_adapter(inst):
+                        added += 1
             else:
                 current.consecutive_misses = 0
 
@@ -480,8 +512,8 @@ class P2PController:
             adapter = self._adapters[peer_id]
             adapter.consecutive_misses += 1
             if adapter.consecutive_misses > _MAX_MISSES:
-                self._remove_adapter(peer_id)
-                removed += 1
+                if self._remove_adapter(peer_id):
+                    removed += 1
         return added, removed
 
     @staticmethod
@@ -536,22 +568,28 @@ class P2PController:
         )
         return True
 
-    def _remove_adapter(self, peer_id: str) -> None:
+    def _remove_adapter(self, peer_id: str) -> bool:
         """Drain and remove the peer L2 adapter for ``peer_id``.
 
         Args:
             peer_id: Instance id of the peer whose adapter to remove.
+
+        Returns:
+            Whether removal completed. Failed drains remain tracked for retry.
         """
         with self._orch_lock:
-            adapter = self._adapters.pop(peer_id, None)
+            adapter = self._adapters.get(peer_id)
         if adapter is None:
-            return
+            return False
         try:
             self._ctx.storage_manager.delete_l2_adapter(adapter.adapter_id)
         except Exception:
             logger.exception("Failed to remove P2P adapter for peer %s", peer_id)
-            return
+            return False
+        with self._orch_lock:
+            self._adapters.pop(peer_id, None)
         logger.debug("Removed P2P adapter for peer %s", peer_id)
+        return True
 
     def _active_job_count(self) -> int:
         """Return the number of active P2P lookup jobs (thread-safe)."""

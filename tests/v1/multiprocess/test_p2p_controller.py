@@ -378,6 +378,31 @@ def test_reconcile_no_op_when_peer_unchanged():
     ctx.storage_manager.delete_l2_adapter.assert_not_called()
 
 
+def test_reconcile_unhealthy_peer_reconnects_only_after_drain() -> None:
+    """A live peer with failed transport is replaced without overlapping clients."""
+    controller, ctx = _make_controller()
+    manager = ctx.storage_manager
+    manager.add_l2_adapter.side_effect = [7, 8]
+    peers = {"peerA": _peer("peerA")}
+    controller._reconcile(peers)
+    adapter = MagicMock()
+    adapter.report_status.return_value = {"is_healthy": False}
+    manager.l2_adapters.return_value = [(MagicMock(index=7), adapter)]
+    manager.delete_l2_adapter.side_effect = TimeoutError("draining")
+    assert controller._reconcile(peers) == (0, 0)
+    assert manager.add_l2_adapter.call_count == 1
+    manager.delete_l2_adapter.side_effect = None
+    manager.reset_mock()
+    assert controller._reconcile(peers) == (1, 1)
+    lifecycle = [
+        call[0]
+        for call in manager.mock_calls
+        if call[0] in ("delete_l2_adapter", "add_l2_adapter")
+    ]
+    assert lifecycle == ["delete_l2_adapter", "add_l2_adapter"]
+    assert controller.report_status()["p2p_peers"] == ["peerA"]
+
+
 def test_reconcile_keeps_peer_within_grace():
     """A peer absent for up to _MAX_MISSES cycles keeps its adapter."""
     controller, ctx = _make_controller()
@@ -424,13 +449,73 @@ def test_close_removes_all_adapters():
     ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
     controller._apply_state(
         _P2PState.REGISTERED,
-        {"peerA": _peer("peerA"), "peerB": _peer("peerB", mq_port=5556)},
+        {
+            "peerA": _peer("peerA"),
+            "peerB": _peer("peerB", url="tc-host:10", mq_port=5556),
+        },
     )
 
     controller.close()
 
     removed = {c.args[0] for c in ctx.storage_manager.delete_l2_adapter.call_args_list}
     assert removed == {7, 8}
+
+
+def test_reconcile_endpoint_reuse_drains_before_replacement():
+    """A process restart cannot make new and old adapters share one client."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    controller._reconcile({"old": _peer("old")})
+    ctx.storage_manager.reset_mock()
+    assert controller._reconcile({"new": _peer("new")}) == (1, 1)
+    assert [
+        call[0]
+        for call in ctx.storage_manager.mock_calls
+        if call[0] in ("delete_l2_adapter", "add_l2_adapter")
+    ] == [
+        "delete_l2_adapter",
+        "add_l2_adapter",
+    ]
+    assert set(controller._adapters) == {"new"}
+
+
+def test_reconcile_ambiguous_endpoint_waits_for_membership_convergence():
+    """Overlapping registrations must not select a generation by list order."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    controller._reconcile({"old": _peer("old")})
+    assert controller._reconcile({"old": _peer("old"), "new": _peer("new")}) == (0, 1)
+    assert not controller._adapters
+    assert controller._reconcile({"new": _peer("new"), "old": _peer("old")}) == (0, 0)
+    assert controller._reconcile({"new": _peer("new")}) == (1, 0)
+
+
+def test_reconcile_failed_drain_retains_owner_for_retry():
+    """A timed-out drain must block endpoint reuse until deletion succeeds."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    controller._reconcile({"old": _peer("old")})
+    ctx.storage_manager.delete_l2_adapter.side_effect = TimeoutError("draining")
+    assert controller._reconcile({"new": _peer("new")}) == (0, 0)
+    assert set(controller._adapters) == {"old"}
+    assert ctx.storage_manager.add_l2_adapter.call_count == 1
+    ctx.storage_manager.delete_l2_adapter.side_effect = None
+    assert controller._reconcile({"new": _peer("new")}) == (1, 1)
+
+
+def test_poll_excludes_previous_instance_at_own_endpoint():
+    """A restarted server must not connect to its own expired registration."""
+    controller, ctx = _make_controller()
+    controller._instance_id = "self"
+    controller._p2p_config = P2PConfig(advertise_url="me:1")
+    controller._fetch_instances = MagicMock(
+        return_value=[
+            _peer("self", url="me:1"),
+            _peer("old-self", url="me:1"),
+        ]
+    )
+    controller._poll_cycle()
+    ctx.storage_manager.add_l2_adapter.assert_not_called()
 
 
 # ============================================================================

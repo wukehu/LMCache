@@ -322,7 +322,9 @@ def test_lookup_retrieve_and_cleanup(
     assert not any(worker.get_finished(set()))
     mock_io.scheduler.cleanup_lookup_result.reset_mock()
     delay_free, params = scheduler.request_finished(request, [1, 2])
-    assert delay_free is (kv_role != "kv_consumer" and not lazy_offload)
+    # Lookup hits are not STORE operations; a receive-only request never waits
+    # for a synthetic send completion, including when its remote load failed.
+    assert delay_free is False
     assert params == {
         "cached_token_stats": {
             "num_vllm_cached_tokens": 4,

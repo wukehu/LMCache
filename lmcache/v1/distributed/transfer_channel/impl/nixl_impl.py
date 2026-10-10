@@ -147,7 +147,16 @@ class NixlTransferChannelClient(TransferChannelClient):
             self._remote_handle,
             remote_idx,
         )
-        agent.transfer(handle)
+        try:
+            agent.transfer(handle)
+        except Exception:
+            # No task owns the handle until submission succeeds. Preserve the
+            # transport error even if cleanup of the rejected transfer fails.
+            try:
+                agent.release_xfer_handle(handle)
+            except Exception:
+                logger.exception("Failed to release rejected NIXL transfer")
+            raise
 
         with self._lock:
             task_id = self._task_counter
@@ -176,9 +185,9 @@ class NixlTransferChannelClient(TransferChannelClient):
             return TransferChannelReadResult(finished=False, succeeded_mask=[])
 
         # Terminal state (DONE or ERR): release the handle and report.
+        self._ctx.agent.release_xfer_handle(handle)
         with self._lock:
             self._tasks.pop(task_id, None)
-        self._ctx.agent.release_xfer_handle(handle)
 
         if status == "DONE":
             return TransferChannelReadResult(

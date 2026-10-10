@@ -521,6 +521,7 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     new_caches = {"layer.0": fake_tensor, "layer.1": fake_tensor}
 
     adapter.register_kv_caches(new_caches)
+    assert len(FakeHeartbeatThread.instances) == 1
 
     assert adapter.kv_caches is new_caches
     req_client.register_kv_cache.assert_called_once()
@@ -1168,6 +1169,49 @@ def test_failed_retrieve_marks_blocks_for_recompute(
     assert "req-1" not in adapter.retrieve_futures
 
 
+def test_failed_retrieve_and_engine_finish_report_receive_only(fake_adapter) -> None:
+    """An engine-finished failed load must not release scheduler state twice."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(name="retrieve_future")
+    retrieve_future.query.return_value = True
+    retrieve_future.result.return_value = False
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7, 8])
+
+    stores, retrieves = adapter.get_finished({"req-1", "unrelated"})
+
+    assert stores == set()
+    assert retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {7, 8}
+    assert "req-1" not in adapter.retrieve_futures
+    assert adapter.get_finished({"req-1", "unrelated"}) == (set(), set())
+
+
+def test_failed_retrieve_engine_finish_in_later_callback(fake_adapter) -> None:
+    """Receive-only failure cannot produce a later synthetic send completion."""
+    adapter, _send_mock, _future = fake_adapter
+    future = MagicMock()
+    future.query.return_value = True
+    future.result.return_value = False
+    adapter.retrieve_futures["req-1"] = (future, [7, 8])
+    assert adapter.get_finished(set()) == (set(), {"req-1"})
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+
+
+@pytest.mark.parametrize("healthy,writer", [(False, True), (True, False)])
+def test_skipped_eager_store_completes_when_engine_finishes(
+    fake_adapter, healthy: bool, writer: bool
+) -> None:
+    """Skipped STORE metadata still settles the scheduler's delayed free."""
+    adapter, _send_mock, _future = fake_adapter
+    adapter.lazy_offload = False
+    adapter.parallel_strategy = MagicMock(is_kv_writer=writer)
+    if not healthy:
+        adapter._health_event.clear()
+    adapter.submit_store_request("req-1", MagicMock(), None)
+    assert adapter.get_finished({"req-1"}) == ({"req-1"}, set())
+    assert adapter.get_finished({"req-1"}) == (set(), set())
+
+
 def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> None:
     """A failed full async load must not re-enter remote wait forever."""
     pytest.importorskip("vllm")
@@ -1639,3 +1683,39 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     assert adapter._reregister_kv_caches_callback() is ring_ok
+
+
+@pytest.mark.parametrize("recovery_succeeds", [True, False])
+def test_heartbeat_recovers_missing_registration_without_observed_downtime(
+    monkeypatch: pytest.MonkeyPatch, recovery_succeeds: bool
+) -> None:
+    """Reachability stays healthy across a restart; stale registration must recover."""
+    probes: list[int | None] = []
+
+    def ping(
+        req_client: RequestClient, timeout: float, instance_id: int | None = None
+    ) -> bool:
+        probes.append(instance_id)
+        return instance_id is None
+
+    monkeypatch.setattr(adapter_mod, "send_ping", ping)
+    event = threading.Event()
+    event.set()
+    heartbeat = HeartbeatThread(MagicMock(), event, interval=60.0, instance_id=42)
+    called = threading.Event()
+    observed: list[bool] = []
+
+    def recover() -> bool:
+        observed.append(event.is_set())
+        called.set()
+        return recovery_succeeds
+
+    heartbeat.register_recover_callback(recover)
+    try:
+        heartbeat.start()
+        assert called.wait(5)
+    finally:
+        heartbeat.stop(timeout=5)
+    assert probes == [42, None]
+    assert observed == [False]
+    assert event.is_set() is recovery_succeeds
