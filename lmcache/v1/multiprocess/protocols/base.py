@@ -91,6 +91,15 @@ class RequestType(enum.Enum):
 
     CB_PROTOCOL_HANDSHAKE = enum.auto()
 
+    # Appended values preserve every existing wire request number.
+    SHM_V2_HANDSHAKE = enum.auto()
+    SHM_V2_PREPARE_STORE = enum.auto()
+    SHM_V2_COMMIT_STORE = enum.auto()
+    SHM_V2_PREPARE_RETRIEVE = enum.auto()
+    SHM_V2_COMMIT_RETRIEVE = enum.auto()
+    SHM_V2_ACK = enum.auto()
+    SHM_V2_ABORT_STORE = enum.auto()
+
     # Deprecated aliases.
     CB_REGISTER_ROPE_V3 = CB_REGISTER_ROPE
     CB_UNREGISTER_ROPE_V3 = CB_UNREGISTER_ROPE

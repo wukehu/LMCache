@@ -23,6 +23,14 @@ Key Types:
 """
 
 
+@dataclass(frozen=True)
+class LookupSessionRef:
+    """One RPC argument identifying a specific lookup generation."""
+
+    request_id: str
+    lookup_id: str
+
+
 @dataclass(order=True, frozen=True)
 class IPCCacheServerKey:
     """Cache key for the IPC (multiprocess) protocol.
@@ -69,12 +77,29 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # Lookup/cleanup scope; global world_size still defines object identity.
+    # Old clients omit this field and retain the all-worker lookup behavior.
+    lookup_worker_ids: tuple[int, ...] | None = field(default=None, compare=False)
+
+    # Per-lookup ownership nonce, never part of reusable cache identity.
+    # Empty keeps legacy wire decoding possible; clients must negotiate the
+    # ownership protocol before claiming protection from stale RPCs.
+    lookup_id: str = field(default="", compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
     _SALT_MAX_LEN = 128
 
     def __post_init__(self) -> None:
+        if self.lookup_worker_ids is not None:
+            ids = self.lookup_worker_ids
+            if self.worker_id is not None:
+                raise ValueError("Lookup scope requires worker_id=None")
+            if not ids or tuple(sorted(set(ids))) != ids:
+                raise ValueError("Lookup workers must be nonempty, sorted and unique")
+            if ids[0] < 0 or ids[-1] >= self.world_size:
+                raise ValueError("Lookup worker is outside global world size")
         bad = self._SALT_FORBIDDEN_CHARS & set(self.cache_salt)
         if bad:
             raise ValueError(
@@ -132,12 +157,23 @@ class IPCCacheServerKey:
             )
         return self.num_kv_readers
 
+    @property
+    def lookup_world_size(self) -> int:
+        """Return lookup fan-out without changing global cache identity."""
+        if self.worker_id is not None:
+            return 1
+        if self.lookup_worker_ids is not None:
+            return len(self.lookup_worker_ids)
+        return self.world_size
+
     def no_worker_id_version(self) -> "IPCCacheServerKey":
         """Create a copy with worker_id=None for lookup requests."""
         return IPCCacheServerKey(
             model_name=self.model_name,
             world_size=self.world_size,
             worker_id=None,
+            lookup_worker_ids=self.lookup_worker_ids,
+            lookup_id=self.lookup_id,
             num_kv_readers=self.num_kv_readers,
             token_ids=self.token_ids,
             start=self.start,

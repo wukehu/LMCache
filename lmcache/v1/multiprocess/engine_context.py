@@ -2,7 +2,7 @@
 """Shared context and layout descriptor registry for engine modules."""
 
 # Standard
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TypedDict
 import threading
 
@@ -37,6 +37,14 @@ class ShmPoolInfo(TypedDict):
 
 
 @dataclass
+class _WorkerLayoutEntry:
+    """One worker id's per-group layouts and its active registration count."""
+
+    group_layout_descs: dict[int, MemoryLayoutDesc]
+    ref_count: int
+
+
+@dataclass
 class _LayoutDescEntry:
     """Stored layout descriptor and its active registration count."""
 
@@ -47,6 +55,10 @@ class _LayoutDescEntry:
     order. Defaults to a single full-attention group."""
     group_layout_descs: dict[int, MemoryLayoutDesc] | None = None
     """Per-group layout descriptors, or ``None`` if all share ``layout_desc``."""
+    worker_entries: dict[int, _WorkerLayoutEntry] = field(default_factory=dict)
+    """Per-group layouts of each worker id that registered with one. Every
+    worker registration is also counted in ``ref_count``, so these entries
+    never outlive the pair's entry."""
 
 
 class LayoutDescRegistry:
@@ -57,6 +69,12 @@ class LayoutDescRegistry:
     for prefetch tasks. Multiple worker instances can share the same
     ``(model_name, world_size)`` entry, so the registry keeps the descriptor
     until the last matching registration is unregistered.
+
+    Workers of one pair can hold different layouts: pipeline-parallel stages
+    host different numbers of layers, so their objects of one object group
+    differ in size. A registration that names its worker id is therefore also
+    kept per worker id; the pair-wide descriptor is the latest registration's
+    and serves the workers that never named theirs.
     """
 
     def __init__(self) -> None:
@@ -71,11 +89,13 @@ class LayoutDescRegistry:
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         group_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
+        worker_id: int | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
         Re-registering the same pair increments the active registration
-        count. The latest descriptor is retained for lookups.
+        count. The latest descriptor is retained for lookups, both pair-wide
+        and for ``worker_id``.
 
         Args:
             model_name: The model name.
@@ -87,6 +107,10 @@ class LayoutDescRegistry:
                 (each group is a separate keyed allocation); ``None`` derives
                 one entry per object group in ``attn_desc``, all sharing
                 ``layout_desc``.
+            worker_id: The worker id (``IPCCacheServerKey.worker_id``) whose
+                KV shard these layouts describe, or ``None`` when the
+                registering client did not name it. A named worker's layouts
+                are returned by :meth:`find_worker_group_layout_descs`.
         """
         key = (model_name, world_size)
         attn_desc = replace(attn_desc, world_size=world_size)
@@ -96,29 +120,51 @@ class LayoutDescRegistry:
             }
         with self._lock:
             entry = self._registry.get(key)
+            if worker_id is not None:
+                if not 0 <= worker_id < world_size:
+                    raise ValueError("Layout worker is outside global world size")
+                previous = entry.worker_entries.get(worker_id) if entry else None
+                if previous is not None and previous.group_layout_descs != group_layout_descs:
+                    raise ValueError("Conflicting layouts for the same global KV shard")
             if entry is None:
-                self._registry[key] = _LayoutDescEntry(
+                entry = _LayoutDescEntry(
                     layout_desc=layout_desc,
                     ref_count=1,
                     attn_desc=attn_desc,
                     group_layout_descs=group_layout_descs,
                 )
+                self._registry[key] = entry
+            else:
+                entry.layout_desc = layout_desc
+                entry.attn_desc = attn_desc
+                entry.group_layout_descs = group_layout_descs
+                entry.ref_count += 1
+
+            if worker_id is None:
                 return
+            worker_entry = entry.worker_entries.get(worker_id)
+            if worker_entry is None:
+                entry.worker_entries[worker_id] = _WorkerLayoutEntry(
+                    group_layout_descs=group_layout_descs, ref_count=1
+                )
+            else:
+                worker_entry.group_layout_descs = group_layout_descs
+                worker_entry.ref_count += 1
 
-            entry.layout_desc = layout_desc
-            entry.attn_desc = attn_desc
-            entry.group_layout_descs = group_layout_descs
-            entry.ref_count += 1
-
-    def unregister(self, model_name: str, world_size: int) -> None:
+    def unregister(
+        self, model_name: str, world_size: int, worker_id: int | None = None
+    ) -> None:
         """Unregister one layout descriptor registration for a pair.
 
         The descriptor is removed only when the last active registration for
-        the pair is unregistered.
+        the pair is unregistered; a worker's layouts likewise stay until the
+        last registration naming that worker is unregistered.
 
         Args:
             model_name: The model name.
             world_size: The world size.
+            worker_id: The worker id the registration was made with (the
+                ``worker_id`` passed to :meth:`register`).
         """
         key = (model_name, world_size)
         with self._lock:
@@ -131,6 +177,13 @@ class LayoutDescRegistry:
                 return
 
             entry.ref_count -= 1
+            if worker_id is None:
+                return
+            worker_entry = entry.worker_entries[worker_id]
+            if worker_entry.ref_count <= 1:
+                del entry.worker_entries[worker_id]
+            else:
+                worker_entry.ref_count -= 1
 
     def find(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
         """Look up a layout descriptor by (model_name, world_size).
@@ -157,6 +210,31 @@ class LayoutDescRegistry:
             if entry is None:
                 return None
             return entry.group_layout_descs
+
+    def find_worker_group_layout_descs(
+        self, model_name: str, world_size: int
+    ) -> dict[int, dict[int, MemoryLayoutDesc]]:
+        """Look up the per-group layouts of each worker id of a pair.
+
+        Args:
+            model_name: The model name.
+            world_size: The world size.
+
+        Returns:
+            Maps worker id to that worker's ``{object_group_id: layout}``,
+            for the worker ids registered by :meth:`register` with a
+            ``worker_id``. Empty when the pair is unregistered or no
+            registration named its worker; workers missing here use
+            :meth:`find_group_layout_descs`.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            if entry is None:
+                return {}
+            return {
+                worker_id: worker_entry.group_layout_descs
+                for worker_id, worker_entry in entry.worker_entries.items()
+            }
 
     def find_attn_desc(self, model_name: str, world_size: int) -> AttnWindowDesc:
         """Look up the attention-window descriptor for a pair.
@@ -206,6 +284,9 @@ class MPCacheServerContext:
         hash_algorithm: str = "blake3",
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        max_sessions: int = 65536,
+        resource_budget=None,
+        request_limits=None,
     ) -> None:
         self._chunk_size = chunk_size
         self._separate_object_groups = separate_object_groups
@@ -222,7 +303,9 @@ class MPCacheServerContext:
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
-        self._session_manager = SessionManager(self._token_hasher)
+        self._session_manager = SessionManager(
+            self._token_hasher, max_sessions=max_sessions,
+            resource_budget=resource_budget, request_limits=request_limits)
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
 

@@ -1,0 +1,195 @@
+{
+  "upstream": "https://github.com/LMCache/LMCache",
+  "upstream_branch": "dev",
+  "base_commit": "05a013b29da78cf2321b9b46ec5039dde2fb0bb0",
+  "patch_set": "runtime-pp-exp30-preserved-20261010",
+  "status": "preserved-runtime-overlay-not-a-release",
+  "companion_vllm_branch": "feature-runtime-pp-exp30-preserved-20261010",
+  "validation": "All 44 LMCache files match the recorded exp30 installed-source hashes; Python syntax checked. Full package build and runtime tests not rerun. Local source workspaces remain separately preserved.",
+  "files": [
+    {
+      "path": "lmcache/integration/vllm/kubernetes_pp.py",
+      "sha256": "fc9672b3e254e06e1a42885bb7f759a5066fbb682387d3308eae644747b4957c"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_connector.py",
+      "sha256": "6deebef0310e25697f7aec5076575fa8ece37d93ba2442aa0eb2af00233b8730"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_metadata.py",
+      "sha256": "e711b9591851eb9edd4e00fe23653cd608e435d9b96b9dd073bc8b0ef25c5451"
+    },
+    {
+      "path": "lmcache/integration/vllm/pp_namespace.py",
+      "sha256": "26830eecec5ca8665bbcecb79d5552d7b20b9820c0c93ffb45855f4609d56175"
+    },
+    {
+      "path": "lmcache/integration/vllm/pp_topology.py",
+      "sha256": "9707cbb59fbd9ee6accb04c457932fac4f993c4b50fc0e4c01881a956558e6c2"
+    },
+    {
+      "path": "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+      "sha256": "d6cfab0b1bbde0edb33c0b24af31900ee607aff2e723d8f14cc91edd6149654b"
+    },
+    {
+      "path": "lmcache/v1/distributed/api.py",
+      "sha256": "86cf507ebe0957056a0c546e66ed725f41d899c0e0cca746865e4e01ffceda13"
+    },
+    {
+      "path": "lmcache/v1/distributed/l1_manager.py",
+      "sha256": "0776114b5c70b7524a8b68fdeb9c611bfeeb8a231ac42f881f3468dc0e9e9cff"
+    },
+    {
+      "path": "lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py",
+      "sha256": "45633d82fb68725d37eba666e7d5d2ac462ecb8e36e2f62904c8a2495fe594b8"
+    },
+    {
+      "path": "lmcache/v1/distributed/read_lease.py",
+      "sha256": "55de990545f7b509364dbafdd36535a33887720a6aaf1745339c12281ba5a661"
+    },
+    {
+      "path": "lmcache/v1/distributed/storage_controllers/prefetch_controller.py",
+      "sha256": "49a2b0e6f521e6931de0b550999ccd8f9e8adca30f78c544bcce312183240826"
+    },
+    {
+      "path": "lmcache/v1/distributed/storage_manager.py",
+      "sha256": "c999360cf3832fee3d24e34a44f22bbde312bd3c108caac7555b652cf72e4da2"
+    },
+    {
+      "path": "lmcache/v1/gpu_connector/kv_format/types.py",
+      "sha256": "6d9b8f8d9a9b136a418858fc3248b8aabd8b90c886c6f5cbaccb09646e16c939"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/config.py",
+      "sha256": "a5e9bda82c0db306841c1a033c17506399801be47a1926918afe71e6e822d924"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/custom_types.py",
+      "sha256": "2a9332187c048226be0f63f1e5490299edaf0cd325874db683bf33326b25f467"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/engine_context.py",
+      "sha256": "0b19cb0d92581d0128bab83e53d4e4d96f081c4f5706779ca871f83a8cac882f"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/engine_module.py",
+      "sha256": "95a5ee1f0d83034dfe854aae205078d2c6f75221fbb92a4bb25a8e6dd8707ecb"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/engine_driven_transfer.py",
+      "sha256": "78c87336c2522d030c75221952f754a7c65cdcb55ebf74f7a442459fd4f256a4"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py",
+      "sha256": "07feab9e5545e0093956f9b80298337492560f4e11a5dae3b3bf9fc9c7ce1a26"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lookup.py",
+      "sha256": "5d6b8a941403e2a11dd21cbe29a99c375d1d48cb62a4abdff3bc730df818ca53"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/management.py",
+      "sha256": "ab739558c255e5c510711faa85bd8dc971853655f0b914e52b7f7ea5f91b33fd"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/server_transfer.py",
+      "sha256": "13fffbe1761561a6b16a7af8f789fc62fe0d27bc123bcba49d4ebef99c7dad3d"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/mq.py",
+      "sha256": "d4a04b5e99bf9178e385f5dcb7643e5676ed3350b10d269dfd4eb9f576b7205d"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/engine.py",
+      "sha256": "f1c9406f01f5f58c2638aa8eeb74be9026c6b7d126f5b05410b2d5cf017291a4"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/server.py",
+      "sha256": "fbe6544cf3ea6a49e1e0fdc1aabe8a141ef81cc86cdc7b1b67c1ca08accd0e24"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/session.py",
+      "sha256": "f95fa263ac0e905fe1fb223ecc6e7e28d4bce2cf4bf0407ed183aeceb7ebc554"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/client.py",
+      "sha256": "c820aa99c1f27988c709e3279f9bb915358e7e1e2054df0bf2e8aaa03babb149"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/resource_budget.py",
+      "sha256": "cb8469371e98ed448b93d7656b41a822b5c6f952cc3993c0eeb5ac4b9576940e"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/admission_config.py",
+      "sha256": "e7e774ab4339cdc9de1cd1f37afd6e1517609f4d85d316f0215865ab61696f0a"
+    },
+    {
+      "path": "lmcache/v1/distributed/write_lease.py",
+      "sha256": "8c568bcebd81726c45b915ae77658ce3e025380a42de383645e5a8286988c0e0"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/shm_records.py",
+      "sha256": "99e48b6527d02e28ded41fcac4cf12f6d3932ad186a582c307987bfe9d8abdba"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/shm_wire.py",
+      "sha256": "1bec5e3e4a2a266aef1bc0a416b16303ac9468c3db0f63b5944367d84003c228"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/shm_sequence_window.py",
+      "sha256": "bd579eb4f061e2ecbd5f1f06fc1c2ed6b65521b30d52a414da8e5840439e23e0"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/shm_sequenced_store.py",
+      "sha256": "ce0a08112cccf042d8d8559aab5ce4cc430b537e06315caba8dff06cee741fd2"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/base.py",
+      "sha256": "f5b4db4b7ed83156759dc31d258dfe5cfa571744eddb8787dd3c09fd6966453d"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/server.py",
+      "sha256": "fc083caf8d1a8e1c2d396ee5141709ac143dcb04bfc60dbbed6bd16a23be1eea"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/shm_sequence_client.py",
+      "sha256": "2af40c8250e91f4d26329cc6f5681afb0bb76f4364f979e9051b2e369281f5a2"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transfer_context/shm.py",
+      "sha256": "7f37c0967a71ed881a3089a275dc9f5c39e3d38e0ca0d202be9932a9c6adf7be"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transfer_context/worker_transfer.py",
+      "sha256": "a590086d4315da44e6cef692f64edfd6bc5485dd7017e841abf47770ef433ecd"
+    },
+    {
+      "path": "lmcache/v1/platform/cuda/cache_context.py",
+      "sha256": "a80fcec9cff6aed68ac6018c8bf166ae56fa0541474bb5bd621ec97440fe7201"
+    },
+    {
+      "path": "lmcache/v1/platform/base/cache_context.py",
+      "sha256": "68bc7624d16fa9ea27f8754b6954848a3a494cd045533c9f40ad240e6d592c46"
+    },
+    {
+      "path": "lmcache/v1/platform/cuda/ipc_wrapper.py",
+      "sha256": "5dce993ea22dcbccaa77ef825648f3eba6da61b466613e4db8f6ea2920c1b481"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/response_snapshot.py",
+      "sha256": "4e34bd121cb91b850475d95c8a68d375e3866d003c6dc1d4879f0038dba88e08"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/http_apis/info_api.py",
+      "sha256": "909271d4102e3c85fa63c5d6a60591b54a5da88d36ee728b700dfcbf5808d5ab"
+    }
+  ],
+  "companion_vllm_files": {
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py": "83e5604c0c743e7d3818ca34ef6ed314a1124eb37293e67cd41ca6dc00b082b2",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py": "61adedc577fefa4c257755a5f6ea7d60f14f3b9ba9688407b2de5556e9579937",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pp_layout.py": "2308a2a78e43edf401482ad4a774c5feff129af6079d29a5f05deed01ddcd381",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py": "fd3ecce636875b04186aba20126bc803cc37b0f622a45785e3ed52c40f0b491f",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py": "463847b039734798d699fb8bbef91baaf54e994b434a320474188caa0286313a",
+    "vllm/v1/core/sched/scheduler.py": "ed3516d212f07fca6003ffe1c9b41d41734ed8231f3b8f33c90aaa311f747a4c"
+  }
+}

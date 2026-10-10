@@ -36,7 +36,7 @@ from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     engine_group_layer_indices,
 )
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.base.cache_context import BaseCacheContext, CacheContextCleanupError
 
 logger = init_logger(__name__)
 
@@ -369,11 +369,12 @@ class GPUCacheContext(BaseCacheContext):
                 separate_object_groups,
                 full_sw_kv,
             )
-        except BaseException:
-            # Partial construction may have imported some mappings
-            # already; roll them back so a failed registration does not
-            # pin the worker's KV pool.
-            self._close_kv_wrappers()
+        except BaseException as construction_error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                logger.warning("Partial cache-context cleanup retained: %s", cleanup_error)
+                raise CacheContextCleanupError(self) from construction_error
             raise
 
     def _init_impl(
@@ -478,19 +479,36 @@ class GPUCacheContext(BaseCacheContext):
         afterwards -- the caller (``_release_entries``) drops the context
         right after this call.
         """
-        self.cuda_stream_.synchronize()
-        with torch_dev.stream(self.cuda_stream_):
-            get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+        stream = getattr(self, "cuda_stream_", None)
+        if stream is not None:
+            stream.synchronize()
+            temp_buffer = getattr(self, "_temp_buffer", None)
+            if temp_buffer is not None:
+                with torch_dev.stream(stream):
+                    get_gds_context().deregister_gpu_buffer(temp_buffer.buffer)
         self._close_kv_wrappers()
 
     def _close_kv_wrappers(self) -> None:
-        """Close every KV wrapper, continuing past per-wrapper failures."""
-        for wrapper in self._kv_wrappers:
+        """Release each wrapper; preserve failed ownership for a later retry."""
+        pending = []
+        first_error = None
+        wrappers = self._kv_wrappers
+        for index, wrapper in enumerate(wrappers):
             try:
                 wrapper.close()
-            except Exception:
-                logger.warning("KV wrapper close failed", exc_info=True)
-        self._kv_wrappers = []
+            except Exception as error:
+                pending.append(wrapper)
+                if first_error is None:
+                    first_error = error
+            except BaseException:
+                # Preserve this and all unattempted wrappers on interruption.
+                self._kv_wrappers = pending + wrappers[index:]
+                raise
+        self._kv_wrappers = pending
+        if first_error is not None:
+            raise RuntimeError(
+                f"CUDA IPC cleanup incomplete: {len(pending)} wrapper(s) retained"
+            ) from first_error
 
     @property
     def stream(self) -> Any:

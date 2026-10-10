@@ -36,6 +36,12 @@ class MPServerConfig:
     chunk_size: int = 256
     """Chunk size for KV cache operations."""
 
+    max_sessions: int = 65536
+    max_shm_transfer_records: int = 65536
+    """Shared bound for active and retired replay-protected sessions."""
+    resource_limits_json: str | None = None
+    """Explicit experimental admission limits; None preserves legacy behavior."""
+
     max_workers: int = 1
     """Base number of worker threads. Sets default for both GPU and CPU pools."""
 
@@ -128,6 +134,15 @@ class MPServerConfig:
                 negative or a non-zero value below the 30 s floor, or the
                 registration grace is below the reap timeout.
         """
+        if isinstance(self.max_sessions, bool) or not isinstance(self.max_sessions, int) or self.max_sessions <= 0:
+            raise ValueError("max_sessions must be a positive integer")
+        if type(self.max_shm_transfer_records) is not int or self.max_shm_transfer_records <= 0:
+            raise ValueError("max_shm_transfer_records must be a positive integer")
+        if self.resource_limits_json is not None:
+            if self.transport != "zmq":
+                raise ValueError("resource limits currently require ZMQ transport")
+            from lmcache.v1.multiprocess.admission_config import load_admission_config
+            load_admission_config(self.resource_limits_json)
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
         if not math.isfinite(reap) or reap < 0 or (reap != 0 and reap < 30.0):
@@ -269,6 +284,12 @@ def add_mp_server_args(
     mp_group = parser.add_argument_group(
         "MP Server", "Configuration for the multiprocess cache server"
     )
+    mp_group.add_argument("--resource-limits-json", type=str, default=None,
+                         help="Explicit experimental MP admission limits as JSON")
+    mp_group.add_argument("--max-shm-transfer-records", type=int, default=65536,
+                         help="Shared SHM read/write record cap, including completed and quarantined records")
+    mp_group.add_argument("--max-sessions", type=int, default=65536,
+                          help="Maximum active plus retired replay-protected sessions; full budget rejects new sessions.")
     mp_group.add_argument(
         "--instance-id",
         type=str,
@@ -472,6 +493,9 @@ def parse_args_to_mp_server_config(
         host=args.host,
         port=args.port,
         chunk_size=args.chunk_size,
+        max_sessions=getattr(args, "max_sessions", 65536),
+        max_shm_transfer_records=getattr(args, "max_shm_transfer_records", 65536),
+        resource_limits_json=getattr(args, "resource_limits_json", None),
         max_workers=base,
         max_gpu_workers=max_gpu,
         max_cpu_workers=max_cpu,

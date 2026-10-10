@@ -81,11 +81,17 @@ class MPCacheServer:
     ) -> None:
         self._context = context
         self._modules = modules
+        self._request_server = None
 
     @property
     def context(self) -> MPCacheServerContext:
         """Return the shared engine context."""
         return self._context
+
+    @property
+    def rpc_transport_healthy(self) -> bool:
+        server = self._request_server
+        return server is None or (server.worker_thread.is_alive() and not server.is_finished.is_set())
 
     def report_status(self) -> dict:
         """Return an aggregated status dict from all modules.
@@ -105,6 +111,8 @@ class MPCacheServer:
         }
         for module in self._modules:
             status.update(module.report_status())
+        status["rpc_transport_healthy"] = self.rpc_transport_healthy
+        status["is_healthy"] = bool(status["is_healthy"] and self.rpc_transport_healthy)
         return status
 
     def close(self) -> None:
@@ -176,10 +184,10 @@ def _build_modules(
     if mp_config.supported_transfer_mode == "lmcache_driven":
         transfer_modules.append(LMCacheDrivenTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "engine_driven":
-        transfer_modules.append(EngineDrivenTransferModule(ctx))
+        transfer_modules.append(EngineDrivenTransferModule(ctx, mp_config.max_shm_transfer_records))
     elif mp_config.supported_transfer_mode == "auto":
         transfer_modules.append(LMCacheDrivenTransferModule(ctx))
-        transfer_modules.append(EngineDrivenTransferModule(ctx))
+        transfer_modules.append(EngineDrivenTransferModule(ctx, mp_config.max_shm_transfer_records))
     else:
         raise ValueError(
             f"Unsupported supported_transfer_mode '{mp_config.supported_transfer_mode}'"
@@ -266,6 +274,9 @@ def _build_modules(
         liveness_targets.append(module)
         experimental_transfer.append(enabled_module)
 
+    if (mp_config.transport == "zmq" and ctx.shm_pool_info["shm_name"]
+            and any(isinstance(m,EngineDrivenTransferModule) for m in transfer_modules)):
+        experimental_transfer.extend(["shm_sequence_ack_store_v1","shm_sequence_abort_store_v1"])
     management = ManagementModule(
         ctx,
         liveness_targets=liveness_targets,
@@ -317,6 +328,10 @@ def run_cache_server(
     """
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
+    from lmcache.v1.multiprocess.admission_config import load_admission_config
+    admission = load_admission_config(mp_config.resource_limits_json)
+    if admission is not None and admission.response_limits is not None and mp_config.transport != "zmq":
+        raise ValueError("response admission limits require ZMQ transport")
     set_isolated_ipc(mp_config.isolated_ipc)
 
     # mp_config.instance_id is this server's single source of identity (set via
@@ -371,6 +386,9 @@ def run_cache_server(
         hash_algorithm=mp_config.hash_algorithm,
         separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
+        max_sessions=mp_config.max_sessions,
+        resource_budget=admission.session_budget if admission else None,
+        request_limits=admission.request_limits if admission else None,
     )
 
     modules = _build_modules(ctx, mp_config, coordinator_config)
@@ -382,6 +400,11 @@ def run_cache_server(
     InitializeL1Usage(event_bus, ctx.storage_manager)
 
     server = create_request_server(modules, mp_config)
+    if isinstance(server, MessageQueueServer):
+        engine._request_server = server
+    if admission is not None:
+        server.frame_limits = admission.frame_limits
+        server.request_budget = admission.rpc_budget
 
     logger.info(
         "LMCache ZMQ cache server is running on tcp://%s:%d",

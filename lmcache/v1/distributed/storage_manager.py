@@ -33,6 +33,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.read_lease import ReadLeaseToken
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
@@ -70,6 +71,10 @@ from lmcache.v1.mp_observability.trace.decorator import (
 from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
+
+
+class UnsubmittedPrefetchError(RuntimeError):
+    """Submission failed before any asynchronous controller job was accepted."""
 
 
 class StorageManager:
@@ -184,6 +189,8 @@ class StorageManager:
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         mode: Literal["new", "update", "all"],
+        ownership: dict | None = None,
+        write_leases: dict | None = None,
     ) -> dict[ObjectKey, MemoryObj]:
         """
         Reserve the object for writing into the storage manager.
@@ -207,6 +214,8 @@ class StorageManager:
             is_temporary=[False] * len(keys),
             layout_desc=layout_desc,
             mode=mode,
+            ownership=ownership,
+            write_leases=write_leases,
         )
 
         result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
@@ -235,10 +244,20 @@ class StorageManager:
 
         return result
 
+    def adopt_legacy_reads(self, keys: list[ObjectKey], leases: dict) -> tuple:
+        results = self._l1_manager.adopt_legacy_reads(keys, leases)
+        good = [(k, obj) for k, (err, obj) in results.items() if err == L1Error.SUCCESS]
+        return [k for k, _ in good], [obj for _, obj in good]
+
+    def abort_write(self, ownership: dict, write_leases: dict | None = None, *, strict: bool = False) -> None:
+        """Caller must establish device completion before discarding writes."""
+        self._l1_manager.abort_write(ownership, write_leases=write_leases, strict=strict)
+
     @enable_tracing()
     def finish_write(
         self,
         keys: list[ObjectKey],
+        write_leases: dict | None = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
@@ -246,7 +265,7 @@ class StorageManager:
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
         """
-        finish_result = self._l1_manager.finish_write(keys)
+        finish_result = self._l1_manager.finish_write(keys, write_leases=write_leases)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
         self._event_bus.publish(
@@ -259,12 +278,16 @@ class StorageManager:
             )
         )
 
+        if write_leases is not None and failed_keys:
+            raise RuntimeError("Owned write completion rejected by L1")
+
         # TODO: global key states update
 
     @contextmanager
     def read_prefetched_results(
         self,
         keys: list[ObjectKey],
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
     ) -> Iterator[list[MemoryObj] | None]:
         """
         Read the memory objects from L1 storage that has been prefetched beforehand.
@@ -279,7 +302,12 @@ class StorageManager:
                 memory objects corresponding to the requested keys.
 
         Note:
-            If any object is not found in L1 storage, None is yielded. In this case,
+            Owned reservations remain the caller's responsibility even on an
+            exception: Python unwinding does not prove asynchronous GPU work
+            has completed. Use finish_read_prefetched with the exact token and
+            completion claim only after proving it is safe to release.
+
+            For legacy anonymous reservations, if any object is not found in L1 storage, None is yielded. In this case,
             this function will release release the read lock of all successfully read
             memory objects when exiting the context.
 
@@ -298,7 +326,9 @@ class StorageManager:
                 "StorageManager.read_prefetched_results.__enter__",
                 {"keys": keys},
             )
-        read_results = self._l1_manager.unsafe_read(keys)
+        read_results = self._l1_manager.unsafe_read(
+            keys, **({"leases": leases} if leases is not None else {})
+        )
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         bad_keys: list[ObjectKey] = []
@@ -362,7 +392,7 @@ class StorageManager:
         finally:
             # Decrease the read lock for all successfully read memory objects
             # if None is yielded or exception occurs during caller's processing
-            if not all_good or not successfully_yielded:
+            if leases is None and (not all_good or not successfully_yielded):
                 self._l1_manager.finish_read(good_keys)
                 self._event_bus.publish(
                     Event(
@@ -385,6 +415,8 @@ class StorageManager:
         self,
         keys: list[ObjectKey],
         read_locks: int = 1,
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
+        claim_id: str = "",
     ) -> None:
         """Finish reading prefetched objects.
 
@@ -393,7 +425,10 @@ class StorageManager:
             read_locks: Read locks to release per key (the whole
                 reservation when releasing a lookup's locks).
         """
-        finish_result = self._l1_manager.finish_read(keys, read_locks=read_locks)
+        finish_result = self._l1_manager.finish_read(
+            keys, read_locks=read_locks,
+            **({"leases": leases, "claim_id": claim_id} if leases is not None else {})
+        )
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
         self._event_bus.publish(
@@ -425,33 +460,53 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
+        try:
+            return self._prepare_and_submit_prefetch(spec, external_request_id, skip_l2)
+        except UnsubmittedPrefetchError:
+            raise
+        except Exception as error:
+            # All fallible bookkeeping precedes the controller's atomic enqueue.
+            # After acceptance the prepared handle is returned without callbacks.
+            try:
+                self._rollback_unsubmitted_owned_reads(spec)
+            finally:
+                raise UnsubmittedPrefetchError("Prefetch preparation failed") from error
+
+    def _prepare_and_submit_prefetch(self, spec, external_request_id, skip_l2):
         keys = spec.keys
 
         if spec.mode is PrefetchMode.WARM:
             # Warm path: load all keys, lock none. skip_l2 makes it a no-op.
-            prefetch_request_id = -1
-            if not skip_l2 and keys and self._l2_adapters:
-                prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                    spec
-                )
-            return PrefetchHandle(
-                prefetch_request_id=prefetch_request_id,
+            enqueue = bool(not skip_l2 and keys and self._l2_adapters)
+            handle = PrefetchHandle(
+                read_leases=spec.read_leases,
+                prefetch_request_id=-1,
                 external_request_id=external_request_id,
                 l1_found_indices=(),
                 l1_hit_chunks=0,
                 total_requested_keys=len(keys),
                 submit_time=time.monotonic(),
                 l2_orig_indices=(
-                    tuple(range(len(keys))) if prefetch_request_id != -1 else ()
+                    tuple(range(len(keys))) if enqueue else ()
                 ),
             )
+            return self._enqueue_prepared_prefetch(spec, keys if enqueue else [], handle)
 
         # NOTE: now we only have L1, so the prefetch is essentially checking how many
         # objects are already in L1, and adding read locks to them.
 
-        l1_read_result = self._l1_manager.reserve_read(
-            keys, read_locks=spec.num_kv_readers
-        )
+        try:
+            l1_read_result = self._l1_manager.reserve_read(
+                keys, read_locks=spec.num_kv_readers,
+                **({"leases": spec.read_leases} if spec.read_leases is not None else {})
+            )
+        except Exception as error:
+            # Capacity and observer rejection happen before any L2 enqueue.
+            # Preserve that evidence so Lookup can retire its admission slot.
+            try:
+                self._rollback_unsubmitted_owned_reads(spec)
+            finally:
+                raise UnsubmittedPrefetchError("L1 reservation rejected before submission") from error
 
         if spec.policy is TrimPolicy.SPARSE:
             # SPARSE: retain a read lock on every L1 hit (not just the leading
@@ -471,7 +526,7 @@ class StorageManager:
                     sparse_l2_indices.append(i)
                     remaining_keys.append(key)
 
-            self._event_bus.publish(
+            self._publish_prefetch_before_submission(spec,
                 Event(
                     event_type=EventType.SM_READ_PREFETCHED,
                     metadata={
@@ -481,22 +536,20 @@ class StorageManager:
                 )
             )
 
-            prefetch_request_id = -1
-            if not skip_l2 and remaining_keys and self._has_l2_adapters():
-                prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                    replace(spec, keys=remaining_keys)
-                )
-            return PrefetchHandle(
-                prefetch_request_id=prefetch_request_id,
+            enqueue = bool(not skip_l2 and remaining_keys and self._has_l2_adapters())
+            handle = PrefetchHandle(
+                read_leases=spec.read_leases,
+                prefetch_request_id=-1,
                 external_request_id=external_request_id,
                 l1_found_indices=tuple(l1_found_indices),
                 l1_hit_chunks=0,
                 total_requested_keys=len(keys),
                 submit_time=time.monotonic(),
                 l2_orig_indices=(
-                    tuple(sparse_l2_indices) if prefetch_request_id != -1 else ()
+                    tuple(sparse_l2_indices) if enqueue else ()
                 ),
             )
+            return self._enqueue_prepared_prefetch(spec, remaining_keys if enqueue else [], handle)
 
         # PREFIX: fold the per-(group, chunk, rank) L1 presence into the
         # model-wide hit and the per-object-group retain set (sliding-window
@@ -511,6 +564,57 @@ class StorageManager:
             )
 
         raise ValueError(f"Unsupported trim policy: {spec.policy}")
+
+    def _enqueue_prepared_prefetch(self, spec, keys, handle):
+        if keys:
+            request_id = self._submit_l2_with_owned_rollback(spec, keys)
+            # Finalize this private, already allocated frozen handle before it
+            # escapes. Do not allocate a replacement or invoke observers after
+            # enqueue: the controller now owns asynchronous work and read leases.
+            object.__setattr__(handle, "prefetch_request_id", request_id)
+        return handle
+
+    def _submit_l2_with_owned_rollback(
+        self, spec: PrefetchRequestSpec, remaining_keys: list[ObjectKey]
+    ) -> int:
+        # Controller submission is atomic: on error no job has been handed
+        # to its consumer. Only this lookup's existing L1 shares can be freed.
+        try:
+            return self._prefetch_controller.submit_prefetch_request(
+                replace(spec, keys=remaining_keys)
+            )
+        except Exception as error:
+            try:
+                self._rollback_unsubmitted_owned_reads(spec)
+            finally:
+                raise UnsubmittedPrefetchError("Prefetch was not submitted") from error
+
+    def _publish_prefetch_before_submission(self, spec, event) -> None:
+        try:
+            self._event_bus.publish(event)
+        except Exception as error:
+            try:
+                self._rollback_unsubmitted_owned_reads(spec)
+            finally:
+                raise UnsubmittedPrefetchError("Prefetch was not submitted") from error
+
+    def _rollback_unsubmitted_owned_reads(self, spec: PrefetchRequestSpec) -> None:
+        # Only call before a controller job can own or mutate this lease map.
+        if not spec.read_leases:
+            return
+        owned = dict(spec.read_leases)
+        try:
+            self._l1_manager.finish_read(
+                list(owned), read_locks=spec.num_kv_readers,
+                leases=owned, claim_id="submission-rejected",
+            )
+        finally:
+            # A listener may fail after the actual decrement. Keep ownership
+            # metadata for anything still pinned, discard only confirmed gone.
+            for key, token in owned.items():
+                if (spec.read_leases.get(key) == token
+                        and not self._l1_manager.owned_reads_pending({key: token})):
+                    spec.read_leases.pop(key)
 
     def _submit_prefix_fold(
         self,
@@ -559,13 +663,21 @@ class StorageManager:
         released_bitmap = l1_presence & (~retain)
         released = released_bitmap.gather(keys)
         if released:
-            self._l1_manager.finish_read(released, read_locks=spec.num_kv_readers)
+            result = self._l1_manager.finish_read(
+                released, read_locks=spec.num_kv_readers,
+                **({"leases": spec.read_leases, "claim_id": "prefix-unhanded"}
+                   if spec.read_leases is not None else {})
+            )
+            if spec.read_leases is not None:
+                for key, error in result.items():
+                    if error == L1Error.SUCCESS:
+                        spec.read_leases.pop(key, None)
 
         # Keys from chunk l1_hit_chunks onwards are candidates for L2.
         l1_key_boundary = l1_hit_chunks * stride
         remaining_keys = keys[l1_key_boundary:]
 
-        self._event_bus.publish(
+        self._publish_prefetch_before_submission(spec,
             Event(
                 event_type=EventType.SM_READ_PREFETCHED,
                 metadata={
@@ -580,27 +692,23 @@ class StorageManager:
         l2_orig_indices: tuple[int, ...] = ()
 
         if not l1_only and remaining_keys:
-            prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                replace(spec, keys=remaining_keys)
-            )
             l2_orig_indices = tuple(range(l1_key_boundary, len(keys)))
 
         submit_time = time.monotonic()
         logger.debug(
-            "Prefetch request submitted: "
+            "Preparing prefetch request: "
             "%d total keys, %d L1 hit chunks (%d retained keys), "
             "%d remaining for L2 "
-            "(external_request_id=%s, "
-            "prefetch_request_id=%d)",
+            "(external_request_id=%s)",
             len(keys),
             l1_hit_chunks,
             len(retained_indices),
             len(remaining_keys),
             external_request_id,
-            prefetch_request_id,
         )
 
-        return PrefetchHandle(
+        handle = PrefetchHandle(
+            read_leases=spec.read_leases,
             prefetch_request_id=prefetch_request_id,
             external_request_id=external_request_id,
             l1_found_indices=tuple(retained_indices),
@@ -608,6 +716,9 @@ class StorageManager:
             total_requested_keys=len(keys),
             submit_time=submit_time,
             l2_orig_indices=l2_orig_indices,
+        )
+        return self._enqueue_prepared_prefetch(
+            spec, remaining_keys if not l1_only else [], handle
         )
 
     def _combine_found(
@@ -707,9 +818,16 @@ class StorageManager:
         """
         l2_r: Bitmap | None = None
         if handle.prefetch_request_id != -1:
-            l2_r = self._prefetch_controller.query_prefetch_result(
-                handle.prefetch_request_id
-            )
+            # Transfer the destructive controller result into the handle
+            # before allocating/merging bitmaps or notifying observers.
+            # Normal polling and cancellation share this same handle.
+            state = handle.result_state
+            with state.lock:
+                if state.l2_result is None:
+                    state.l2_result = self._prefetch_controller.query_prefetch_result(
+                        handle.prefetch_request_id
+                    )
+                l2_r = state.l2_result
             if l2_r is None:
                 return None
 
@@ -767,11 +885,14 @@ class StorageManager:
         skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
         return deleted, skipped
 
+    def owned_reads_pending(self, leases: dict) -> bool:
+        return self._l1_manager.owned_reads_pending(leases)
+
     def unsafe_read(
-        self, keys: list[ObjectKey]
+        self, keys: list[ObjectKey], leases: dict | None = None
     ) -> tuple[list[ObjectKey], list[MemoryObj]]:
         """Read already read-locked objects without acquiring new read locks."""
-        read_results = self._l1_manager.unsafe_read(keys)
+        read_results = self._l1_manager.unsafe_read(keys, **({"leases": leases} if leases is not None else {}))
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         for key in keys:

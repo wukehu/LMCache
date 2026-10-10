@@ -74,11 +74,13 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
     request_configs: dict[str, Any] | None = None
+    lookup_id: str = ""
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
 
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
+        self.lookup_id = ""
         self.cache_salt: str = request.cache_salt or ""
         self.request_configs = extract_request_configs_from_request(request)
         self.all_token_ids = request.all_token_ids
@@ -183,6 +185,7 @@ class LMCacheMPRequestMetadata:
     op: LoadStoreOp
     cache_salt: str = ""
     request_configs: dict[str, Any] | None = None
+    lookup_id: str = ""
 
     @staticmethod
     def GetStoreMetadata(
@@ -345,6 +348,7 @@ class LMCacheMPRequestMetadata:
             ret = LMCacheMPRequestMetadata(
                 request_id=tracker.request_id,
                 direction="RETRIEVE",
+                lookup_id=tracker.lookup_id,
                 op=op,
                 cache_salt=tracker.cache_salt,
                 request_configs=tracker.request_configs,

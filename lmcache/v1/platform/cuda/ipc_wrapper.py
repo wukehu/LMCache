@@ -101,6 +101,8 @@ class _VmmMapping:
     base_ptr: int
     alloc_handle: object
     refcount: int
+    cleanup_phase: int = 0
+    retiring: bool = False
 
 
 # Refcounted registry of VMM allocations this process has imported via
@@ -392,29 +394,47 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         close -- their later garbage collection is harmless (the CuPy
         memory is unowned; no device call is issued on collection).
 
-        Unmap failures are logged, not raised: close runs on teardown
-        paths (the worker reaper) where raising would abort cleanup of
-        the remaining entries.
+        A failed final unmap retains this wrapper's references and raises.
+        The owner must retain the wrapper and retry cleanup before retirement.
         """
-        opens = getattr(self, "_opens", 0)
-        if opens <= 0:
-            return
         with _MAPPINGS_LOCK:
-            self._opens = 0
+            # Read under the registry lock: concurrent closes of the same
+            # wrapper must not subtract the same reference count twice.
+            opens = getattr(self, "_opens", 0)
+            if opens <= 0:
+                return
             entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
-            if entry is None:
+            if entry is None or entry[1] < opens:
+                raise RuntimeError("CUDA IPC mapping ownership is inconsistent")
+            if entry[1] > opens:
+                entry[1] -= opens
+                self._opens = 0
                 return
-            entry[1] -= opens
-            if entry[1] > 0:
-                return
-            del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
             device_index = self._get_device_index_from_uuid(self.device_uuid)
             with torch.cuda.device(device_index):
                 (err,) = _cuda.runtime.cudaIpcCloseMemHandle(entry[0])
             if err != _cuda.runtime.cudaError_t.cudaSuccess:
-                logger.warning(
-                    "cudaIpcCloseMemHandle failed: %s (ptr=0x%x)", err, entry[0]
+                raise RuntimeError(
+                    f"cudaIpcCloseMemHandle failed: {err} (ptr=0x{entry[0]:x})"
                 )
+            # Commit ownership removal only after the driver accepts unmap.
+            del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
+            self._opens = 0
+
+
+def _release_vmm_mapping(entry: _VmmMapping, alloc_size: int) -> None:
+    """Resume release while the caller holds the mapping registry lock."""
+    steps = (
+        ("cuMemUnmap", lambda: _cuda.driver.cuMemUnmap(entry.base_ptr, alloc_size)),
+        ("cuMemAddressFree", lambda: _cuda.driver.cuMemAddressFree(entry.base_ptr, alloc_size)),
+        ("cuMemRelease", lambda: _cuda.driver.cuMemRelease(entry.alloc_handle)),
+    )
+    while entry.cleanup_phase < len(steps):
+        name, release = steps[entry.cleanup_phase]
+        result = release()
+        if result[0] != _cuda.driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"{name} failed during VMM cleanup: {result[0]}")
+        entry.cleanup_phase += 1
 
 
 class VmmCudaIPCWrapper(DeviceIPCWrapper):
@@ -610,6 +630,8 @@ class VmmCudaIPCWrapper(DeviceIPCWrapper):
                 with torch.cuda.device(device_index):
                     entry = self._import_and_map(device_index)
                 _MAPPED_VMM_ALLOCATIONS[self._export_id] = entry
+            if entry.retiring:
+                raise RuntimeError("VMM mapping is pending cleanup")
             entry.refcount += 1
             self._opens += 1
             base_ptr = entry.base_ptr
@@ -639,9 +661,8 @@ class VmmCudaIPCWrapper(DeviceIPCWrapper):
         (VMM handles are refcounted by the driver, so an unclosed import
         pins the memory even after the exporter dies).
 
-        Idempotent. Failures are logged, not raised: close runs on
-        teardown paths where raising would abort cleanup of the
-        remaining entries.
+        Failed cleanup retains ownership and its completed phase for retry.
+        No new tensor reference may use a mapping once final cleanup starts.
         """
         fd = getattr(self, "_fd", None)
         if fd is not None:
@@ -651,34 +672,21 @@ class VmmCudaIPCWrapper(DeviceIPCWrapper):
             except OSError:
                 logger.warning("closing exported VMM fd %d failed", fd)
 
-        opens = getattr(self, "_opens", 0)
-        if opens <= 0:
-            return
         with _MAPPINGS_LOCK:
-            self._opens = 0
+            opens = getattr(self, "_opens", 0)
+            if opens <= 0:
+                return
             entry = _MAPPED_VMM_ALLOCATIONS.get(self._export_id)
-            if entry is None:
+            if entry is None or entry.refcount < opens:
+                raise RuntimeError("VMM mapping ownership is inconsistent")
+            if entry.refcount > opens:
+                entry.refcount -= opens
+                self._opens = 0
                 return
-            entry.refcount -= opens
-            if entry.refcount > 0:
-                return
+            entry.retiring = True
+            _release_vmm_mapping(entry, self._alloc_size)
             del _MAPPED_VMM_ALLOCATIONS[self._export_id]
-            base_ptr, alloc_handle = entry.base_ptr, entry.alloc_handle
-            for what, result in (
-                ("cuMemUnmap", _cuda.driver.cuMemUnmap(base_ptr, self._alloc_size)),
-                (
-                    "cuMemAddressFree",
-                    _cuda.driver.cuMemAddressFree(base_ptr, self._alloc_size),
-                ),
-                ("cuMemRelease", _cuda.driver.cuMemRelease(alloc_handle)),
-            ):
-                if result[0] != _cuda.driver.CUresult.CUDA_SUCCESS:
-                    logger.warning(
-                        "%s failed during VMM mapping close: %s (ptr=0x%x)",
-                        what,
-                        result[0],
-                        base_ptr,
-                    )
+            self._opens = 0
 
     def __getstate__(self) -> dict[str, object]:
         """Pickle without process-local state (fd, registry references)."""
@@ -771,26 +779,37 @@ class VmmCudaIPCWrapper(DeviceIPCWrapper):
                     f"cuMemImportFromShareableHandle(fabric) failed: {err}"
                 )
 
-        err, base = driver.cuMemAddressReserve(self._alloc_size, 0, 0, 0)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            driver.cuMemRelease(handle)
-            raise RuntimeError(f"cuMemAddressReserve failed: {err}")
-
-        (err,) = driver.cuMemMap(base, self._alloc_size, 0, handle, 0)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            driver.cuMemAddressFree(base, self._alloc_size)
-            driver.cuMemRelease(handle)
-            raise RuntimeError(f"cuMemMap failed: {err}")
-
-        access = driver.CUmemAccessDesc()
-        access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        access.location.id = device_index
-        access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        (err,) = driver.cuMemSetAccess(base, self._alloc_size, [access], 1)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            driver.cuMemUnmap(base, self._alloc_size)
-            driver.cuMemAddressFree(base, self._alloc_size)
-            driver.cuMemRelease(handle)
-            raise RuntimeError(f"cuMemSetAccess failed: {err}")
-
-        return _VmmMapping(base_ptr=int(base), alloc_handle=handle, refcount=0)
+        # Cleanup phases reflect resources actually acquired: handle only,
+        # then reserved VA, then mapped VA. The registry lock is already held.
+        entry = _VmmMapping(base_ptr=0, alloc_handle=handle, refcount=0,
+                            cleanup_phase=2)
+        try:
+            err, base = driver.cuMemAddressReserve(self._alloc_size, 0, 0, 0)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemAddressReserve failed: {err}")
+            entry.base_ptr = int(base)
+            entry.cleanup_phase = 1
+            (err,) = driver.cuMemMap(base, self._alloc_size, 0, handle, 0)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemMap failed: {err}")
+            entry.cleanup_phase = 0
+            access = driver.CUmemAccessDesc()
+            access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+            access.location.id = device_index
+            access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            (err,) = driver.cuMemSetAccess(base, self._alloc_size, [access], 1)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemSetAccess failed: {err}")
+            return entry
+        except BaseException:
+            entry.retiring = True
+            try:
+                _release_vmm_mapping(entry, self._alloc_size)
+            except BaseException as cleanup_error:
+                # The wrapper is already held by the constructing context.
+                # Preserve a cleanup-only reference for its close/retry path.
+                entry.refcount = 1
+                self._opens += 1
+                _MAPPED_VMM_ALLOCATIONS[self._export_id] = entry
+                logger.warning("Partial VMM import cleanup retained: %s", cleanup_error)
+            raise

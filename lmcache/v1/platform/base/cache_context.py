@@ -33,6 +33,14 @@ if TYPE_CHECKING:
     from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 
 
+class CacheContextCleanupError(RuntimeError):
+    """Construction failed and the caller must retain cleanup ownership."""
+
+    def __init__(self, context):
+        super().__init__("Cache context construction cleanup incomplete")
+        self.context = context
+
+
 class BaseCacheContext(ABC):
     """Abstract base for GPU and CPU cache contexts.
 

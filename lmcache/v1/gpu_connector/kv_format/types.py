@@ -59,3 +59,4 @@ class LayoutHints(TypedDict, total=False):
     tokens_per_block: int
     kv_list_layout: Literal["k_v"]
     head_dim: int
+    kv_worker_id: int

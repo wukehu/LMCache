@@ -7,6 +7,8 @@ from multiprocessing import shared_memory
 from multiprocessing.resource_tracker import unregister
 from typing import Any
 import ctypes
+import threading
+from lmcache.v1.multiprocess.shm_sequence_client import ShmSequenceClient,STORE_FEATURE,ABORT_FEATURE
 
 # Third Party
 import torch
@@ -89,8 +91,14 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
+        *, recovery_enabled: bool = True,
     ) -> None:
         super().__init__(metadata, req_client, mq_timeout)
+        self._sequence_clients={}
+        self._sequence_lock=threading.Lock()
+        self._recovery_stop=threading.Event()
+        self._recovery_thread=None
+        self._recovery_cursor=0
         if not shm_name or pool_size <= 0:
             raise ValueError("shm_name must be non-empty and pool_size must be > 0")
 
@@ -119,6 +127,29 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._shm = None
             self._shm_buffer = None
             raise
+
+        if recovery_enabled:
+            self._recovery_thread=threading.Thread(target=self._recover_loop,name='lmcache-shm-recovery',daemon=True)
+            self._recovery_thread.start()
+
+    def _recover_loop(self):
+        while not self._recovery_stop.wait(.25):
+            if not self._sequence_lock.acquire(blocking=False):continue
+            try:clients=tuple(c for c in self._sequence_clients.values() if c is not None)
+            finally:self._sequence_lock.release()
+            if not clients:continue
+            budget=4
+            start=self._recovery_cursor%len(clients)
+            for offset in range(min(16,len(clients))):
+                if self._recovery_stop.is_set() or budget<=0:break
+                client=clients[(start+offset)%len(clients)]
+                self._recovery_cursor=start+offset+1
+                try:
+                    budget-=client.recover_pending(limit=1,timeout=.25)
+                except Exception:
+                    # Keep ownership intact and report unexpected recovery faults.
+                    logger.exception('SHM background recovery failed')
+                    budget-=1
 
     def _make_tensor_view(
         self,
@@ -156,9 +187,33 @@ class EngineDrivenContextShm(EngineDrivenContext):
             for descriptor in descriptors
         ]
 
+    def _sequence_client(self,instance_id):
+        with self._sequence_lock:
+            if instance_id in self._sequence_clients:
+                return self._sequence_clients[instance_id]
+            result=None
+            if hasattr(self.req_client,'shm_v2_handshake'):
+                capabilities=self.req_client.get_experimental().result(timeout=self.mq_timeout)
+                if STORE_FEATURE in capabilities:
+                    identity=self.req_client.shm_v2_handshake(instance_id).result(timeout=self.mq_timeout)
+                    result=ShmSequenceClient(self.req_client,instance_id,self.mq_timeout,identity,supports_abort=ABORT_FEATURE in capabilities)
+            self._sequence_clients[instance_id]=result
+            return result
+
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> tuple[list[torch.Tensor], list[int]] | None:
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is not None:
+            try:response=sequenced.prepare(key)
+            except TimeoutError as exc:
+                raise LMCacheTimeoutError(
+                    f"Sequenced PREPARE_STORE timed out for instance_id={instance_id}",
+                    session_id=key.request_id,
+                ) from exc
+            context=response.context
+            slots=context.get('slots',[])
+            return (self._build_slot_tensors(slots),context['chunk_indices']) if slots else ([],[])
         future = self.req_client.prepare_store(key, instance_id)
         # wait() first so a timeout raises exactly one LMCacheTimeoutError
         # (one event); result() then returns without its own timeout.
@@ -182,6 +237,10 @@ class EngineDrivenContextShm(EngineDrivenContext):
     def commit_store(
         self, key: IPCCacheServerKey, instance_id: int, _chunks: list[torch.Tensor]
     ) -> bool:
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is not None:
+            try:return sequenced.commit(key)
+            except TimeoutError:return False
         future = self.req_client.commit_store(key, instance_id, b"")
         try:
             return bool(future.result(timeout=self.mq_timeout))
@@ -191,6 +250,19 @@ class EngineDrivenContextShm(EngineDrivenContext):
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> list[torch.Tensor] | None:
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is not None and 'retrieve' in sequenced.identity.operations:
+            try:
+                response=sequenced.prepare(key,kind='retrieve')
+                if not response.success:
+                    # No memory was exported; retire the miss without requiring
+                    # callers to COMMIT a None result. Keep retry state on loss.
+                    sequenced.commit(key,kind='retrieve')
+                    return None
+            except TimeoutError as exc:
+                raise LMCacheTimeoutError('Sequenced PREPARE_RETRIEVE timed out',session_id=key.request_id) from exc
+            slots=response.context.get('slots',[])
+            return self._build_slot_tensors(slots) if slots else None
         future = self.req_client.prepare_retrieve(key, instance_id)
         try:
             response = future.result(timeout=self.mq_timeout)
@@ -202,13 +274,34 @@ class EngineDrivenContextShm(EngineDrivenContext):
         return self._build_slot_tensors(slots) if slots else None
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is not None and 'retrieve' in sequenced.identity.operations:
+            try:return sequenced.commit(key,kind='retrieve')
+            except TimeoutError:return False
         future = self.req_client.commit_retrieve(key, instance_id)
         try:
             return bool(future.result(timeout=self.mq_timeout))
         except TimeoutError:
             return False
 
+    def abort_store(self,key,instance_id,*,access_complete):
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is None:raise RuntimeError('sequenced SHM abort unavailable')
+        try:return sequenced.abort_store(key,access_complete=access_complete)
+        except TimeoutError:return False
+
+    def abandon_retrieve(self,key,instance_id,*,access_complete):
+        sequenced=self._sequence_client(instance_id)
+        if sequenced is None:raise RuntimeError('sequenced SHM read abandon unavailable')
+        try:return sequenced.abandon_retrieve(key,access_complete=access_complete)
+        except TimeoutError:return False
+
     def close(self) -> None:
+        self._recovery_stop.set()
+        if self._recovery_thread is not None:
+            self._recovery_thread.join(timeout=2)
+            if self._recovery_thread.is_alive():
+                raise RuntimeError('SHM recovery still active; retaining mapping')
         if self._shm is None:
             return
         self._unpin_shm_buffer()

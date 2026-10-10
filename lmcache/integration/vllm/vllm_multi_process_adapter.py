@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
+import functools
 import math
 import os
 import threading
@@ -19,18 +20,20 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.pp_topology import KVParallelTopology
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    LookupSessionRef,
 )
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
-from lmcache.v1.multiprocess.mq import MessagingFuture
+from lmcache.v1.multiprocess.mq import MessagingFuture, abandon_messaging_future
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -220,13 +223,42 @@ def get_lmcache_chunk_size(
         An integer representing the LMCache chunk size
     """
     future = req_client.get_chunk_size()
-    lmcache_tokens_per_chunk = future.result(timeout=timeout)
+    try:
+        lmcache_tokens_per_chunk = future.result(timeout=timeout)
+    except TimeoutError:
+        abandon_messaging_future(future)
+        raise
     return lmcache_tokens_per_chunk
+
+
+def validate_lookup_replay_budget(capabilities: set[str], timeout: float) -> None:
+    """Require an explicit retention budget before enabling tagged requests.
+
+    Reserve two RPC budgets for in-flight operation and cleanup. This is a
+    startup constraint, not a guarantee against indefinitely queued messages.
+    """
+    if "lookup_generation_v1" not in capabilities:
+        return
+    prefix = "lookup_replay_ttl_seconds="
+    values = [cap[len(prefix):] for cap in capabilities if cap.startswith(prefix)]
+    if len(values) != 1:
+        raise ValueError("Tagged lookup requires one advertised replay retention window")
+    try:
+        retention = float(values[0])
+    except ValueError as exc:
+        raise ValueError("Invalid advertised replay retention window") from exc
+    if (not math.isfinite(timeout) or timeout <= 0
+            or not math.isfinite(retention) or retention < 2 * timeout):
+        raise ValueError(
+            f"Replay retention {retention}s must cover two positive RPC budgets "
+            f"({timeout}s each)"
+        )
 
 
 def get_experimental(
     req_client: RequestClient,
     timeout: float = DEFAULT_MQ_TIMEOUT,
+    replay_timeout: float | None = None,
 ) -> set[str]:
     """Query the experimental capabilities a server advertises.
 
@@ -237,16 +269,28 @@ def get_experimental(
     Returns:
         Experimental features built into the server (now `transfer_query`).
     """
-    future = req_client.get_experimental()
+    configure = getattr(req_client, "configure_capabilities", None)
+    future = None
     try:
-        return set(future.result(timeout=timeout))
+        future = req_client.get_experimental()
+        capabilities = set(future.result(timeout=timeout))
+        if replay_timeout is not None:
+            validate_lookup_replay_budget(capabilities, replay_timeout)
     except TimeoutError:
+        abandon_messaging_future(future)
         logger.warning(
             "LMCache server did not answer GET_EXPERIMENTAL within %ss; "
             "treating it as advertising no experimental capabilities.",
             timeout,
         )
-        return set()
+        capabilities = set()
+    except Exception:
+        if configure is not None:
+            configure(set())
+        raise
+    if configure is not None:
+        configure(capabilities)
+    return capabilities
 
 
 def _raise_server_unreachable(server_url: str, timeout: float) -> NoReturn:
@@ -295,10 +339,12 @@ def send_ping(
     Returns:
         True if server is healthy, False on timeout or error.
     """
+    future = None
     try:
         future = req_client.ping(instance_id)
         return future.result(timeout=timeout)
     except TimeoutError:
+        abandon_messaging_future(future)
         return False
     except Exception:
         logger.debug("Ping failed with exception", exc_info=True)
@@ -336,9 +382,31 @@ class ParallelStrategy:
     ``dcp_size`` token shards instead of one replicated copy."""
 
     @property
+    def pp_topology(self) -> KVParallelTopology | None:
+        """Return global PP geometry, or None for the existing PP1 path.
+
+        Raises:
+            ValueError: For unsupported PP+DCP or inconsistent rank geometry.
+        """
+        if self.pp_size == 1:
+            return None
+        if self.dcp_size != 1:
+            raise ValueError("PP shared cache requires DCP=1")
+        topology = KVParallelTopology(
+            self.tp_size, self.pp_size, self.n_servers, self.mla_only
+        )
+        if topology.world_size != self.vllm_world_size:
+            raise ValueError("PP topology does not match the engine world size")
+        topology.validate_rank(self.vllm_worker_id)
+        return topology
+
+    @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
         on the LMCache server storage."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.shard_count
         if self.mla_only:
             # MLA replicates KV across TP; distinct bytes exist only per
             # pipeline stage and per DCP token shard.
@@ -351,6 +419,9 @@ class ParallelStrategy:
         """Index of the piece of a single token chunk's KV cache
         that the current worker is responsible for,
         in ``[0, kv_world_size)``."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.shard_id(self.vllm_worker_id)
         if self.mla_only:
             # Row-major over (pipeline stage, token shard).
             pp_stage = self.vllm_worker_id // self.tp_size
@@ -371,6 +442,9 @@ class ParallelStrategy:
         split never under-reserves (the server takes one read lock per
         declared reader).
         """
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.readers_per_shard
         if not self.mla_only:
             return 1
         return math.ceil(self.kv_tp_size / self.dcp_size)
@@ -378,11 +452,17 @@ class ParallelStrategy:
     @property
     def kv_tp_size(self) -> int:
         """Tensor-parallel size as seen from a single LMCache server."""
+        topology = self.pp_topology
+        if topology is not None:
+            return min(self.tp_size, topology.ranks_per_server)
         return self.tp_size // self.n_servers
 
     @property
     def is_kv_writer(self) -> bool:
         """Whether this rank is responsible for storing KV."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.is_writer(self.vllm_worker_id)
         if not self.mla_only:
             return True
         if self.dcp_size > 1:
@@ -441,6 +521,14 @@ def _normalize_adapter_init_args(
     return int(legacy_block_size), strategy, mq_timeout
 
 
+def get_server_epoch(features: set[str]) -> str | None:
+    """Read the optional boot identity from the existing capability response."""
+    epochs = [x for x in features if x.startswith("server_epoch_v1:")]
+    if len(epochs) > 1 or any(x == "server_epoch_v1:" for x in epochs):
+        raise ValueError("Invalid MP server epoch advertisement")
+    return epochs[0] if epochs else None
+
+
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
 
@@ -455,6 +543,9 @@ class HeartbeatThread(PeriodicThread):
         health_event: threading.Event,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         instance_id: int | None = None,
+        server_epoch: str | None = None,
+        registration_aware: bool = False,
+        replay_timeout: float | None = None,
     ):
         """
         Args:
@@ -477,8 +568,11 @@ class HeartbeatThread(PeriodicThread):
         self._health_event = health_event
         self._interval = interval
         self._instance_id = instance_id
+        self._server_epoch = server_epoch
+        self._registration_aware = registration_aware
+        self._replay_timeout = replay_timeout
 
-        # Optional callback invoked on the unhealthy->healthy edge,
+        # Callback also runs when a successful ping observes a new boot epoch.
         # before the health event is set. See register_recover_callback.
         def noop() -> bool:
             return True
@@ -519,6 +613,30 @@ class HeartbeatThread(PeriodicThread):
             self._req_client, timeout=self._interval, instance_id=self._instance_id
         )
 
+        registration_missing = False
+        if not healthy and self._registration_aware and self._instance_id is not None:
+            self._health_event.clear()
+            # A positive untracked ping separates lost registration from an
+            # unreachable server. Restore registration before publishing health.
+            healthy = send_ping(self._req_client, timeout=self._interval, instance_id=None)
+            registration_missing = healthy
+
+        observed_epoch = self._server_epoch
+        if healthy and (self._server_epoch is not None or self._replay_timeout is not None):
+            try:
+                features = get_experimental(
+                    self._req_client, timeout=self._interval,
+                    replay_timeout=self._replay_timeout,
+                )
+                if self._replay_timeout is not None and "lookup_generation_v1" not in features:
+                    raise ValueError("MP server stopped advertising lookup generation support")
+                observed_epoch = get_server_epoch(features)
+                if self._server_epoch is not None and observed_epoch is None:
+                    raise ValueError("MP server stopped advertising its epoch")
+            except Exception:
+                logger.warning("Failed to verify MP server epoch", exc_info=True)
+                healthy = False
+
         if self.stop_requested:
             return ThreadRunSummary(
                 success=True,
@@ -526,18 +644,24 @@ class HeartbeatThread(PeriodicThread):
             )
 
         need_trigger_recover = (
-            healthy and not was_healthy and self._recover_callback is not None
+            healthy
+            and (registration_missing or not was_healthy or observed_epoch != self._server_epoch)
+            and self._recover_callback is not None
         )
 
         # Try to call recover callback
         if need_trigger_recover:
+            self._health_event.clear()
             logger.warning(
                 "LMCache server is healthy again, triggering recovery callback"
             )
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
 
+        if self.stop_requested:
+            return ThreadRunSummary(success=True, message="stopped during recovery")
         if healthy:
+            self._server_epoch = observed_epoch
             self._health_event.set()
             if not was_healthy:
                 logger.warning(
@@ -600,6 +724,104 @@ class LoadStoreOp:
 StoreResult = bool
 RetrieveResult = bool
 LookupResult = int
+
+
+class _SessionCleanup:
+    """Drain scheduler RPC dependencies without blocking the scheduler thread.
+
+    Only scheduler messaging futures belong here, never device futures. A
+    terminal dependency is observed before END_SESSION is sent. Timed-out or
+    failed dependencies do not establish server-side completion: report them
+    and leave remote reclamation to the server lifecycle instead of reordering
+    END_SESSION ahead of outstanding work. The END_SESSION acknowledgement is
+    also tracked to completion or explicit abandonment.
+    """
+
+    def __init__(self, clients, timeout, on_failure):
+        self._clients = clients
+        self._timeout = timeout
+        self._on_failure = on_failure
+        self._condition = threading.Condition()
+        self._jobs = {}
+        self._closed = False
+        self._thread = None
+
+    def submit(self, request_id, dependencies, before_end=None):
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Session cleanup is closed")
+            now = time.monotonic()
+            for url, futures in dependencies.items():
+                deadline = min((at + self._timeout for _, at in futures),
+                               default=now + self._timeout)
+                action = (before_end or {}).get(url)
+                self._jobs.setdefault((request_id, url), (futures, deadline, action, False))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="lmcache-session-cleanup", daemon=True
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _run(self):
+        while True:
+            with self._condition:
+                if not self._jobs and not self._closed:
+                    self._condition.wait()
+                jobs = list(self._jobs.items())
+                closed = self._closed
+            for (request_id, url), (futures, deadline, action, end_sent) in jobs:
+                failure = None
+                try:
+                    ready = all(future.query() for future, _ in futures)
+                    if not ready:
+                        if not closed and time.monotonic() < deadline:
+                            continue
+                        raise TimeoutError("Unconfirmed RPC at session cleanup")
+                    for future, _ in futures:
+                        future.result(timeout=0)
+                    if action is not None:
+                        release = action()
+                        if release is not None:
+                            now = time.monotonic()
+                            with self._condition:
+                                self._jobs[(request_id, url)] = (
+                                    [(release, now)], now + self._timeout, None, False
+                                )
+                            continue
+                    if not end_sent:
+                        end_ack = self._clients[url].end_session(request_id)
+                        if end_ack is not None:
+                            now = time.monotonic()
+                            with self._condition:
+                                self._jobs[(request_id, url)] = (
+                                    [(end_ack, now)], now + self._timeout, None, True
+                                )
+                            continue
+                except Exception as exc:
+                    failure = exc
+                with self._condition:
+                    self._jobs.pop((request_id, url), None)
+                if failure is not None:
+                    for future, _ in futures:
+                        abandon_messaging_future(future)
+                    logger.warning(
+                        "Session cleanup unconfirmed for request=%s server=%s: %s",
+                        request_id, url, failure,
+                    )
+                    self._on_failure(url)
+            with self._condition:
+                if self._closed and not self._jobs:
+                    return
+                if self._jobs:
+                    self._condition.wait(timeout=0.01)
 
 
 class LMCacheMPSchedulerAdapter:
@@ -681,22 +903,42 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params: dict[
             str, tuple[list[int], str, dict[str, Any] | None]
         ] = {}
+        # Keep unlock acknowledgements across allocation-time lookup cleanup;
+        # END_SESSION must not overtake an unlock that reads session metadata.
+        self._lookup_releases: dict[str, dict[str, list[tuple[Any, float]]]] = {}
+        self._lookup_ids: dict[str, str] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
 
         # Read chunk size from lmcache
         chunk_sizes: dict[str, int] = {}
+        peer_capabilities: dict[str, set[str]] = {}
         for url, client in self.req_clients.items():
             try:
                 chunk_sizes[url] = get_lmcache_chunk_size(
                     client, timeout=self._mq_timeout
                 )
+                peer_capabilities[url] = get_experimental(client, timeout=self._mq_timeout)
+                try:
+                    validate_lookup_replay_budget(peer_capabilities[url], self._mq_timeout)
+                except ValueError:
+                    for peer in self.req_clients.values():
+                        peer.close()
+                    raise
+                if parallel_strategy.pp_size > 1:
+                    if "pp_shared_v1" not in peer_capabilities[url]:
+                        for peer in self.req_clients.values():
+                            peer.close()
+                        raise ValueError(f"MPServer {url} does not advertise pp_shared_v1")
             except TimeoutError:
                 for c in self.req_clients.values():
                     c.close()
                 _raise_server_unreachable(url, self._mq_timeout)
 
+        self._lookup_generation_enabled = all(
+            "lookup_generation_v1" in caps for caps in peer_capabilities.values()
+        )
         # All servers must share chunk_size, otherwise the min() aggregation
         # over per-server hits would mix different granularities.
         unique_sizes = set(chunk_sizes.values())
@@ -735,6 +977,9 @@ class LMCacheMPSchedulerAdapter:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = parallel_strategy.vllm_world_size
         self._store_request_pending_counts: dict[str, int] = {}
+        self._session_cleanup = _SessionCleanup(
+            self.req_clients, self._mq_timeout, self._mark_lookup_timed_out
+        )
 
     @property
     def world_size(self) -> int:
@@ -763,6 +1008,7 @@ class LMCacheMPSchedulerAdapter:
                     req_client=client,
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
+                    replay_timeout=self._mq_timeout if self._lookup_generation_enabled else None,
                 )
                 hb.start()
                 self._heartbeats[url] = hb
@@ -810,6 +1056,9 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
+        if getattr(self, "_lookup_generation_enabled", False):
+            self._lookup_ids.setdefault(request_id, uuid.uuid4().hex)
+
         aligned_end = (
             len(token_ids) // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
@@ -824,7 +1073,9 @@ class LMCacheMPSchedulerAdapter:
         ).no_worker_id_version()
 
         futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+            url: self.req_clients[url].lookup(
+                self._server_lookup_key(key, url), self.tp_size
+            )
             for url in self._server_urls
         }
 
@@ -873,7 +1124,12 @@ class LMCacheMPSchedulerAdapter:
                     cache_salt=cs or "",
                     request_configs=request_configs,
                 ).no_worker_id_version()
-                self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
+                release = self.req_clients[url].free_lookup_locks(
+                    self._server_lookup_key(tail_key, url), self.tp_size
+                )
+                self._lookup_releases.setdefault(request_id, {}).setdefault(url, []).append(
+                    (release, time.monotonic())
+                )
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -946,7 +1202,10 @@ class LMCacheMPSchedulerAdapter:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
                 futures[url] = (
-                    self.req_clients[url].query_prefetch_status(request_id),
+                    self.req_clients[url].query_prefetch_status(
+                        LookupSessionRef(request_id, self._lookup_ids[request_id])
+                        if request_id in getattr(self, "_lookup_ids", {}) else request_id
+                    ),
                     time.monotonic(),
                 )
 
@@ -1013,6 +1272,8 @@ class LMCacheMPSchedulerAdapter:
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
+        # Cleanup must stop using clients before their transport is closed.
+        self._session_cleanup.close()
         for client in self.req_clients.values():
             client.close()
         with self._heartbeat_lock:
@@ -1063,46 +1324,53 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
         for url in self._server_urls:
-            self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
+            release = self.req_clients[url].free_lookup_locks(
+                self._server_lookup_key(base_key, url), self.tp_size
+            )
+            self._lookup_releases.setdefault(request_id, {}).setdefault(url, []).append(
+                (release, time.monotonic())
+            )
 
-    def end_session(self, request_id: str) -> None:
-        """
-        Notify LMCache server to remove the session for a finished request.
-
-        For unacked lookup results, this function will block waiting until
-        they are acked. Already-submitted status requests are also drained
-        before END_SESSION so their handlers cannot recreate the session.
-
-        Args:
-            request_id: The ID of the finished request.
-        """
-        if not self.is_healthy:
-            return
-
+    def end_session(self, request_id: str, unclaimed_lookup=None) -> None:
+        """Queue ordered per-server cleanup without waiting on the scheduler."""
+        dependencies = {url: [] for url in self._server_urls}
         ack = self._unacked_lookups.pop(request_id, None)
         if ack is not None:
-            remaining = max(
-                0.0, self._mq_timeout - (time.monotonic() - ack.submitted_at)
-            )
             for url, fut in ack.futures.items():
-                try:
-                    fut.result(timeout=remaining)
-                except TimeoutError:
-                    self._mark_lookup_timed_out(url)
-                    return
-
-        # Status polling used to complete inside check_lookup_result(). Keep
-        # its ordering before END_SESSION when a request finishes early.
-        for url, (future, submitted_at) in self._lookup_status.pop(
-            request_id, {}
-        ).items():
-            remaining = max(0.0, self._mq_timeout - (time.monotonic() - submitted_at))
-            if not future.wait(timeout=remaining):
-                self._mark_lookup_timed_out(url)
-                return
-
-        for url in self._server_urls:
-            self.req_clients[url].end_session(request_id)
+                dependencies[url].append((fut, ack.submitted_at))
+        statuses = self._lookup_status.pop(request_id, {})
+        for url, (future, submitted_at) in statuses.items():
+            dependencies[url].append((future, submitted_at))
+        for url, releases in self._lookup_releases.pop(request_id, {}).items():
+            dependencies[url].extend(releases)
+        actions = {}
+        if unclaimed_lookup is not None:
+            token_ids, start, known_end, salt, configs = unclaimed_lookup
+            per_server = dict(self._per_server_hits.get(request_id, {}))
+            aggregate = self._finished_lookup_results.get(request_id)
+            base_key = self._create_key(token_ids, start=start, end=start,
+                request_id=request_id, cache_salt=salt, request_configs=configs).no_worker_id_version()
+            for url in self._server_urls:
+                # Freeze request state before caller drops its tracker. Only a
+                # consumed, non-None status owns locks on the client side;
+                # pending prefetches remain owned by server cancellation.
+                def release_unclaimed(url=url):
+                    end = known_end if known_end is not None else aggregate
+                    if end is None:
+                        chunks = per_server.get(url)
+                        if chunks is None and url in statuses:
+                            chunks = statuses[url][0].result(timeout=0)
+                        end = 0 if chunks is None else int(chunks) * self.lmcache_tokens_per_chunk
+                    end = min(end, len(token_ids))
+                    if end <= start:
+                        return None
+                    key = replace(base_key, end=end)
+                    return self.req_clients[url].free_lookup_locks(
+                        self._server_lookup_key(key, url), self.tp_size)
+                actions[url] = release_unclaimed
+        lookup_id = getattr(self, "_lookup_ids", {}).pop(request_id, "")
+        ref = LookupSessionRef(request_id, lookup_id) if lookup_id else request_id
+        self._session_cleanup.submit(ref, dependencies, actions)
 
     def report_block_allocations(
         self,
@@ -1126,6 +1394,16 @@ class LMCacheMPSchedulerAdapter:
             )
 
     # Helper functions
+    def _server_lookup_key(
+        self, key: IPCCacheServerKey, url: str
+    ) -> IPCCacheServerKey:
+        """Scope lookup and cleanup identically to the server's global pieces."""
+        topology = self.parallel_strategy.pp_topology
+        if topology is None:
+            return key
+        server_id = self._server_urls.index(url)
+        return replace(key, lookup_worker_ids=topology.server_shards(server_id))
+
     def _create_key(
         self,
         token_ids: list[int],
@@ -1156,6 +1434,7 @@ class LMCacheMPSchedulerAdapter:
             model_name=self.model_name,
             world_size=self.world_size,
             worker_id=None,
+            lookup_id=getattr(self, "_lookup_ids", {}).get(request_id, ""),
             token_ids=tuple(token_ids),
             start=start,
             end=end,
@@ -1191,6 +1470,18 @@ class LMCacheMPSchedulerAdapter:
             self._mq_timeout,
         )
         self._health_events[url].clear()
+
+
+def _worker_transfer_guard(method):
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        if method.__name__ in ("submit_store_request", "submit_retrieve_request"):
+            self._ensure_heartbeat_started()
+        with self._transfer_lock:
+            if self._transfer_closed:
+                raise RuntimeError("Worker transfer lifecycle is closed")
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 class LMCacheMPWorkerAdapter:
@@ -1273,6 +1564,9 @@ class LMCacheMPWorkerAdapter:
         self.engine_group_infos: list[EngineGroupInfo] = []
         # Transport context for transfer operations.
         self.transfer_ctx: TransferContext | None = None
+        self._transfer_lock = threading.RLock()
+        self._transfer_closed = False
+        self._failed_transfer_context = None
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
@@ -1327,6 +1621,11 @@ class LMCacheMPWorkerAdapter:
         self.experimental: set[str] = get_experimental(
             self.req_client, timeout=self._mq_timeout
         )
+        try:
+            validate_lookup_replay_budget(self.experimental, self._mq_timeout)
+        except ValueError:
+            self.req_client.close()
+            raise
         self.dispatcher: "Dispatcher | None" = None
 
         # Health state (shared with heartbeat thread)
@@ -1440,12 +1739,14 @@ class LMCacheMPWorkerAdapter:
         # Reused when heartbeat recovery re-registers.
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()
-        )
+        ).copy()
+        self._layout_hints["kv_worker_id"] = self.worker_id
         self._send_register_kv_caches_request(kv_caches)
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
 
+    @_worker_transfer_guard
     def _send_register_kv_caches_request(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -1462,32 +1763,48 @@ class LMCacheMPWorkerAdapter:
             ConnectionError: if the server does not respond within
                 mq_timeout.
         """
-        self.kv_caches = kv_caches
+        if self._failed_transfer_context is not None:
+            self._failed_transfer_context.close()
+            self._failed_transfer_context = None
+        previous_context = self.transfer_ctx
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
-        layout_hints = self._layout_hints
-        self.transfer_ctx = transfer_ctx
         try:
-            # Register on the local, not self.transfer_ctx: a concurrent
-            # shutdown() may null self.transfer_ctx between publish and this
-            # call. The local is always non-None.
             transfer_ctx.register(
-                self.instance_id,
-                kv_caches,
-                self.model_name,
-                self.world_size,
-                self.blocks_in_chunk,
-                self.req_client,
-                self._mq_timeout,
-                layout_hints=layout_hints,
+                self.instance_id, kv_caches, self.model_name, self.world_size,
+                self.blocks_in_chunk, self.req_client, self._mq_timeout,
+                layout_hints=self._layout_hints,
                 engine_group_infos=self.engine_group_infos,
                 engine_type=EngineType.VLLM,
             )
-        except TimeoutError:
-            raise ConnectionError(
-                "LMCache server did not respond to "
-                "register_kv_caches within "
-                f"{self._mq_timeout}s. Is the server running?"
-            ) from None
+            if self._transfer_closed or self._heartbeat_stop_requested():
+                raise RuntimeError("Worker stopped during registration")
+            old_identity = getattr(previous_context, "registration_identity", None)
+            new_identity = getattr(transfer_ctx, "registration_identity", None)
+            if old_identity is not None and old_identity == new_identity:
+                if previous_context._closing:
+                    raise RuntimeError("Cannot reuse a closing registration")
+                # Preserve sequence/ticket state on transient health failures.
+                transfer_ctx.close()
+                self.kv_caches = kv_caches
+                return
+            if previous_context is not None:
+                previous_context.close()
+            self.transfer_ctx = transfer_ctx
+            self.kv_caches = kv_caches
+        except Exception as exc:
+            try:
+                transfer_ctx.close()
+            except Exception:
+                # Bound failed cleanup to one retained context. The next
+                # registration must close it before allocating another.
+                self._failed_transfer_context = transfer_ctx
+                logger.exception("Retaining unsuccessful registration context")
+            if isinstance(exc, TimeoutError):
+                raise ConnectionError(
+                    "LMCache server did not respond to register_kv_caches within "
+                    f"{self._mq_timeout}s. Is the server running?"
+                ) from None
+            raise
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.
@@ -1499,9 +1816,13 @@ class LMCacheMPWorkerAdapter:
         recover callback still re-registers on a genuine unhealthy->healthy
         edge (server restart).
         """
+        if self._transfer_closed:
+            return
         if self._heartbeat is not None:
             return
         with self._heartbeat_lock:
+            if self._transfer_closed:
+                return
             if self._heartbeat is not None:
                 return
             heartbeat = HeartbeatThread(
@@ -1509,6 +1830,9 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
                 instance_id=self.instance_id,
+                server_epoch=get_server_epoch(self.experimental),
+                registration_aware="registration_ping_v1" in self.experimental,
+                replay_timeout=self._mq_timeout if "lookup_generation_v1" in self.experimental else None,
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
             heartbeat.start()
@@ -1545,6 +1869,12 @@ class LMCacheMPWorkerAdapter:
             return False
 
         try:
+            # Recovery runs on a fresh heartbeat thread. A device guard may
+            # skip initialization when the ordinal already matches; raw CUDA
+            # IPC export still needs a current context on this thread.
+            device = next(iter(self.kv_caches.values())).device
+            if device.type != "cpu":
+                torch_dev.set_device(device)
             self._send_register_kv_caches_request(self.kv_caches)
         except ConnectionError:
             logger.exception(
@@ -1570,6 +1900,7 @@ class LMCacheMPWorkerAdapter:
 
         return True
 
+    @_worker_transfer_guard
     def create_recorded_event(self) -> _IpcEvent | None:
         """Create the ordering event required by the active transfer context.
 
@@ -1592,6 +1923,7 @@ class LMCacheMPWorkerAdapter:
         return transfer_ctx.create_recorded_event()
 
     @_lmcache_nvtx_annotate
+    @_worker_transfer_guard
     def submit_store_request(
         self,
         request_id: str,
@@ -1612,7 +1944,6 @@ class LMCacheMPWorkerAdapter:
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
         """
-        self._ensure_heartbeat_started()
 
         if not self.is_kv_writer:
             return
@@ -1648,6 +1979,7 @@ class LMCacheMPWorkerAdapter:
             self.store_events[request_id] = event
 
     @_lmcache_nvtx_annotate
+    @_worker_transfer_guard
     def submit_retrieve_request(
         self,
         request_id: str,
@@ -1655,6 +1987,7 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        lookup_id: str = "",
     ) -> None:
         """
         Submit a KV cache retrieve request to LMCache
@@ -1672,7 +2005,6 @@ class LMCacheMPWorkerAdapter:
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
         """
-        self._ensure_heartbeat_started()
 
         if not self.is_healthy:
             self.error_block_ids.update(op.flat_block_ids)
@@ -1688,6 +2020,7 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
+        key = replace(key, lookup_id=lookup_id)
         if self.transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
@@ -1764,6 +2097,7 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salts: list[str] | None = None,
         request_configs_list: list[dict[str, Any] | None] | None = None,
+        lookup_ids: list[str] | None = None,
     ):
         """
         Submit a batched retrieve request to LMCache
@@ -1780,6 +2114,8 @@ class LMCacheMPWorkerAdapter:
             request_configs_list: Optional LMCache request configs, one per
                 request.
         """
+        if lookup_ids is None:
+            lookup_ids = [""] * len(request_ids)
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
         if request_configs_list is None:
@@ -1789,13 +2125,14 @@ class LMCacheMPWorkerAdapter:
             == len(ops)
             == len(cache_salts)
             == len(request_configs_list)
+            == len(lookup_ids)
         ):
             raise ValueError(
                 "request_ids, ops, cache_salts, and request_configs_list "
                 "must have the same length"
             )
-        for request_id, op, salt, request_configs in zip(
-            request_ids, ops, cache_salts, request_configs_list, strict=True
+        for request_id, op, salt, request_configs, lookup_id in zip(
+            request_ids, ops, cache_salts, request_configs_list, lookup_ids, strict=True
         ):
             self.submit_retrieve_request(
                 request_id,
@@ -1803,6 +2140,7 @@ class LMCacheMPWorkerAdapter:
                 event,
                 cache_salt=salt,
                 request_configs=request_configs,
+                lookup_id=lookup_id,
             )
 
     def _process_finished_stores(
@@ -2098,6 +2436,7 @@ class LMCacheMPWorkerAdapter:
         self.error_block_ids.clear()
         return errors
 
+    @_worker_transfer_guard
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:
         """Handle worker-side preemption hints from connector metadata.
 
@@ -2125,35 +2464,40 @@ class LMCacheMPWorkerAdapter:
         on the closing request client, and a straggler in-flight cycle cannot
         re-register or flip the health event after unregistration.
         """
+        self._transfer_closed = True
         with self._heartbeat_lock:
             if self._heartbeat is not None:
                 self._heartbeat.stop()
 
-        logger.info("Unregistering kv caches")
-        try:
-            if isinstance(self.transfer_ctx, EngineDrivenTransferContext):
-                future = self.req_client.unregister_kv_cache_engine_driven_context(
-                    self.instance_id
+        with self._transfer_lock:
+            logger.info("Unregistering kv caches")
+            try:
+                if isinstance(self.transfer_ctx, EngineDrivenTransferContext):
+                    future = self.req_client.unregister_kv_cache_engine_driven_context(
+                        self.instance_id
+                    )
+                else:
+                    future = self.req_client.unregister_kv_cache(self.instance_id)
+                future.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "LMCache server did not respond to unregister within %ss. "
+                    "Proceeding with shutdown.",
+                    self._mq_timeout,
                 )
-            else:
-                future = self.req_client.unregister_kv_cache(self.instance_id)
-            future.result(timeout=self._mq_timeout)
-        except TimeoutError:
-            logger.warning(
-                "LMCache server did not respond to unregister within %ss. "
-                "Proceeding with shutdown.",
-                self._mq_timeout,
-            )
 
-        if self.dispatcher is not None:
-            dispatch(self.dispatcher, "shutdown")
+            if self.dispatcher is not None:
+                dispatch(self.dispatcher, "shutdown")
 
-        if self.transfer_ctx is not None:
-            self.transfer_ctx.close()
-            self.transfer_ctx = None
+            if self.transfer_ctx is not None:
+                self.transfer_ctx.close()
+                self.transfer_ctx = None
 
-        self.req_client.close()
-        self.request_telemetry.close()
+            if self._failed_transfer_context is not None:
+                self._failed_transfer_context.close()
+                self._failed_transfer_context = None
+            self.req_client.close()
+            self.request_telemetry.close()
 
     # Helper functions
     def _update_and_get_finished_store(

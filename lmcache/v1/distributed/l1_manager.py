@@ -9,7 +9,8 @@ from typing import Literal
 import threading
 
 # First Party
-from lmcache.lmcache_native import TTLLock
+from lmcache.v1.distributed.write_lease import OwnedWriteLock
+from lmcache.v1.distributed.read_lease import OwnedReadLock, ReadLeaseToken
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
@@ -41,14 +42,16 @@ class L1ObjectState:
     memory_obj: MemoryObj
     """ The memory object stored in L1 cache. """
 
-    write_lock: TTLLock
+    write_lock: OwnedWriteLock
     """ Whether the object is write-locked. """
 
-    read_lock: TTLLock
+    read_lock: OwnedReadLock
     """ The read lock with TTL for the object. """
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    write_generation: int = 0
 
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
@@ -247,6 +250,7 @@ class L1Manager:
         self,
         keys: list[ObjectKey],
         read_locks: int = 1,
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Reserve read access for the given keys.
 
@@ -270,38 +274,83 @@ class L1Manager:
         total = _validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
-        for key in keys:
-            entry = self._objects.get(key, None)
-            if entry is None:
-                ret[key] = (L1Error.KEY_NOT_EXIST, None)
-                continue
-
-            if not entry.available_for_read():
-                ret[key] = (L1Error.KEY_NOT_READABLE, None)
-                continue
-
-            # TODO(perf): support a count argument in
-            # TTLLock.lock() to avoid Python for-loop
-            # overhead (TTLLock is C++ std::atomic).
-            for _ in range(total):
-                entry.read_lock.lock()
-            ret[key] = (L1Error.SUCCESS, entry.memory_obj)
-            successful_keys.append(key)
-
-        for listener in self._registered_listeners:
-            listener.on_l1_keys_reserved_read(successful_keys)
-        self._event_bus.publish(
-            Event(
-                event_type=EventType.L1_READ_RESERVED,
-                metadata={"keys": successful_keys},
+        try:
+            for key in keys:
+                entry = self._objects.get(key, None)
+                if entry is None:
+                    ret[key] = (L1Error.KEY_NOT_EXIST, None)
+                    continue
+    
+                if not entry.available_for_read():
+                    ret[key] = (L1Error.KEY_NOT_READABLE, None)
+                    continue
+    
+                # TODO(perf): support a count argument in
+                # TTLLock.lock() to avoid Python for-loop
+                # overhead (TTLLock is C++ std::atomic).
+                if leases is not None:
+                    if key in leases:
+                        raise ValueError("Cannot overwrite an outstanding read lease")
+                    leases[key] = entry.read_lock.reserve(total)
+                else:
+                    for _ in range(total):
+                        entry.read_lock.lock()
+                ret[key] = (L1Error.SUCCESS, entry.memory_obj)
+                successful_keys.append(key)
+            for listener in self._registered_listeners:
+                listener.on_l1_keys_reserved_read(successful_keys)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_RESERVED,
+                    metadata={"keys": successful_keys},
+                )
             )
-        )
+        except Exception:
+            # No reservation has escaped to a consumer before this method
+            # returns. Roll back only tokens acquired by this invocation.
+            if leases is not None:
+                for reserved_key in successful_keys:
+                    token = leases.pop(reserved_key)
+                    self._objects[reserved_key].read_lock.release(
+                        token, "reserve-batch-rollback", total
+                    )
+            raise
+
         return ret
+
+    @l1_mgr_synchronized
+    def owned_reads_pending(self, leases: dict[ObjectKey, ReadLeaseToken]) -> bool:
+        """Check exact reservation generations without touching unrelated reads."""
+        return any(
+            (entry := self._objects.get(key)) is not None
+            and entry.read_lock.owns(token)
+            for key, token in leases.items()
+        )
+
+    @l1_mgr_synchronized
+    def adopt_legacy_reads(self, keys: list[ObjectKey], leases: dict) -> dict:
+        """Capture exact objects and consume anonymous shares before SHM export."""
+        if len(set(keys)) != len(keys) or any(k in leases for k in keys):
+            raise ValueError("Cannot overwrite an outstanding read lease")
+        result = {}
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None or not entry.available_for_read():
+                result[key] = (L1Error.KEY_NOT_READABLE, None)
+                continue
+            token = entry.read_lock.adopt_anonymous()
+            if token is None:
+                result[key] = (L1Error.KEY_NOT_READABLE, None)
+                continue
+            leases[key] = token
+            result[key] = (L1Error.SUCCESS, entry.memory_obj)
+        return result
 
     @l1_mgr_synchronized
     def unsafe_read(
         self,
         keys: list[ObjectKey],
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Unsafe read the read-locked objects without adding new read locks.
 
@@ -328,7 +377,9 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
                 continue
 
-            if not entry.read_lock.is_locked():
+            readable = (entry.read_lock.owns(leases.get(key)) if leases is not None
+                        else entry.read_lock.anonymous_is_locked())
+            if not readable:
                 ret[key] = (L1Error.KEY_NOT_READABLE, None)
                 continue
 
@@ -341,6 +392,8 @@ class L1Manager:
         self,
         keys: list[ObjectKey],
         read_locks: int = 1,
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
+        claim_id: str = "",
     ) -> dict[ObjectKey, L1Error]:
         """Finish read access for the given keys.
 
@@ -367,6 +420,12 @@ class L1Manager:
                 read inconsistent data.
         """
         total = _validate_read_locks(read_locks)
+        if leases is not None and not claim_id:
+            raise ValueError("Owned read release requires claim_id")
+        if leases is not None:
+            for key in keys:
+                if not isinstance(leases.get(key), ReadLeaseToken):
+                    raise ValueError("Owned read release requires a token for every key")
         need_to_free: list[MemoryObj] = []
         need_to_free_keys: list[ObjectKey] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -374,6 +433,15 @@ class L1Manager:
 
         for key in keys:
             entry = self._objects.get(key, None)
+            if leases is not None and (
+                entry is None or not entry.read_lock.owns(leases[key])
+            ):
+                # Completed tokens are not retained indefinitely; absence is
+                # a safe no-op, not proof of a previously successful claim.
+                logger.debug("Ignoring inactive owned read token for key %s", key)
+                ret[key] = (L1Error.KEY_NOT_EXIST if entry is None
+                            else L1Error.KEY_IN_WRONG_STATE)
+                continue
             if entry is None:
                 logger.warning(
                     "L1Manager: finish read on non-existing key %s, "
@@ -392,7 +460,9 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
-            if not entry.read_lock.is_locked():
+            readable = (entry.read_lock.owns(leases.get(key)) if leases is not None
+                        else entry.read_lock.anonymous_is_locked())
+            if not readable:
                 logger.warning(
                     "L1Manager: finish read on non-read-locked key %s, "
                     "potential inconsistent data might be read",
@@ -404,8 +474,14 @@ class L1Manager:
             # TODO(perf): support a count argument in
             # TTLLock.unlock() to avoid Python for-loop
             # overhead (TTLLock is C++ std::atomic).
-            for _ in range(total):
-                entry.read_lock.unlock()
+            if leases is not None:
+                if not entry.read_lock.release(leases[key], claim_id, total):
+                    # An active reservation retains the exact claim/count.
+                    ret[key] = L1Error.SUCCESS
+                    continue
+            else:
+                for _ in range(total):
+                    entry.read_lock.unlock()
             if entry.is_temporary and not entry.read_lock.is_locked():
                 # NOTE: temporary objects shouldn't have write-locks
                 need_to_free.append(entry.memory_obj)
@@ -443,6 +519,8 @@ class L1Manager:
         is_temporary: list[bool],
         layout_desc: MemoryLayoutDesc,
         mode: Literal["new", "update", "all"] = "all",
+        ownership: dict | None = None,
+        write_leases: dict | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Reserve write access for the given keys.
 
@@ -456,6 +534,9 @@ class L1Manager:
             - "new": Reserve only new objects that do not exist.
             - "update": Reserve only existing objects for update.
             - "all": Reserve all writable objects regardless of existence.
+            write_leases: Optional output mapping of key to (entry, token).
+                These writers never expire. The exact receipt is required for
+                finish/abort; callers must retain it across uncertain outcomes.
 
         Returns:
             A dictionary mapping each object key to a tuple of
@@ -465,6 +546,10 @@ class L1Manager:
             KEY_NOT_WRITABLE: The key exists but is not writable.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
         """
+        # Never overwrite a live receipt, including a duplicate key in this call.
+        if write_leases is not None:
+            if len(set(keys)) != len(keys) or any(k in write_leases for k in keys):
+                raise ValueError("Cannot overwrite an outstanding write lease")
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -483,7 +568,14 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                 continue
 
-            entry.write_lock.lock()
+            if write_leases is None:
+                entry.write_lock.lock()
+            else:
+                token = entry.write_lock.reserve()
+                write_leases[key] = (entry, token)
+            entry.write_generation += 1
+            if ownership is not None:
+                ownership[key] = (entry, entry.write_generation)
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
 
@@ -515,11 +607,19 @@ class L1Manager:
             ):
                 self._objects[key] = L1ObjectState(
                     memory_obj=mem_obj,
-                    write_lock=TTLLock(self._write_ttl_seconds),
-                    read_lock=TTLLock(self._read_ttl_seconds),
+                    write_lock=OwnedWriteLock(self._write_ttl_seconds),
+                    read_lock=OwnedReadLock(self._read_ttl_seconds),
                     is_temporary=is_temp,
                 )
-                self._objects[key].write_lock.lock()
+                entry = self._objects[key]
+                if write_leases is None:
+                    entry.write_lock.lock()
+                else:
+                    token = entry.write_lock.reserve()
+                    write_leases[key] = (entry, token)
+                self._objects[key].write_generation = 1
+                if ownership is not None:
+                    ownership[key] = (self._objects[key], 1)
                 ret[key] = (L1Error.SUCCESS, mem_obj)
                 successful_keys.append(key)
 
@@ -534,9 +634,55 @@ class L1Manager:
         return ret
 
     @l1_mgr_synchronized
+    def abort_write(self, ownership: dict, write_leases: dict | None = None, *, strict: bool = False) -> None:
+        """Discard a captured writer only after all writes are known complete.
+
+        write_leases selects explicit ownership and ignores legacy ownership.
+        Unknown device/SHM completion must retain the receipt and allocation.
+        """
+        removed = []
+        objects = []
+        receipts = ownership if write_leases is None else write_leases
+        if strict:
+            if write_leases is None:
+                raise ValueError("strict abort requires explicit ownership")
+            # Validate the entire set before changing any object. A changed
+            # state must not be reported as successful cancellation.
+            for key, (owner, generation) in receipts.items():
+                entry = self._objects.get(key)
+                if entry is None or entry is not owner:
+                    continue
+                if not entry.write_lock.owns(generation) or entry.read_lock.is_locked():
+                    raise RuntimeError("strict abort ownership no longer exclusive")
+        for key, (owner, generation) in receipts.items():
+            entry = self._objects.get(key)
+            if entry is not owner:
+                continue
+            if write_leases is None:
+                if entry.write_lock.has_owner() or entry.write_generation != generation:
+                    continue
+            elif not entry.write_lock.owns(generation):
+                continue
+            if not entry.write_lock.is_locked() or entry.read_lock.is_locked():
+                continue
+            removed.append(key)
+            objects.append(entry.memory_obj)
+            del self._objects[key]
+        meta = [self._object_meta(obj) for obj in objects]
+        self._memory_manager.free(objects)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(removed)
+        self._event_bus.publish(Event(
+            event_type=EventType.L1_KEYS_EVICTED,
+            metadata={"keys": removed, "meta": meta},
+        ))
+
+
+    @l1_mgr_synchronized
     def finish_write(
         self,
         keys: list[ObjectKey],
+        write_leases: dict | None = None,
     ) -> dict[ObjectKey, L1Error]:
         """Finish write access for the given keys.
 
@@ -583,7 +729,14 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
-            entry.write_lock.unlock()
+            if write_leases is not None:
+                receipt = write_leases.get(key)
+                if receipt is None or receipt[0] is not entry or not entry.write_lock.finish(receipt[1]):
+                    ret[key] = L1Error.KEY_IN_WRONG_STATE
+                    continue
+            elif not entry.write_lock.unlock():
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
             ret[key] = L1Error.SUCCESS
             if not entry.is_temporary:
                 notification_keys.append(key)
@@ -608,6 +761,7 @@ class L1Manager:
         self,
         keys: list[ObjectKey],
         read_locks: int = 1,
+        leases: dict[ObjectKey, ReadLeaseToken] | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Atomically finish write and acquire read lock for the given keys.
 
@@ -621,6 +775,11 @@ class L1Manager:
             read_locks: Total read locks acquired per key -- one per TP
                 worker that consumes a read lock for the same key
                 (e.g. MLA models with TP > 1).
+
+            leases: Optional output mapping for owned reservations. Each
+                successful key receives a token required for reading/releasing.
+                Existing tokens cannot be overwritten. Without this mapping,
+                the legacy anonymous read-counter path is retained.
 
         Returns:
             A dictionary mapping each object key to a tuple of
@@ -642,7 +801,7 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
                 continue
 
-            if not entry.write_lock.is_locked():
+            if entry.write_lock.has_owner() or not entry.write_lock.is_locked():
                 logger.warning(
                     "L1Manager: finish_write_and_reserve_read on "
                     "non-write-locked key %s",
@@ -659,9 +818,16 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_IN_WRONG_STATE, None)
                 continue
 
+            # Reserve ownership before dropping the write lock. A rejected
+            # reservation must leave the loaded buffer write-protected.
+            if leases is not None:
+                if key in leases:
+                    raise ValueError("Cannot overwrite an outstanding read lease")
+                leases[key] = entry.read_lock.reserve(total)
+            else:
+                for _ in range(total):
+                    entry.read_lock.lock()
             entry.write_lock.unlock()
-            for _ in range(total):
-                entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
             successful_keys_meta.append(self._object_meta(entry.memory_obj))
@@ -707,7 +873,7 @@ class L1Manager:
                 continue
 
             locked = entry.read_lock.is_locked() or entry.write_lock.is_locked()
-            if locked and not force:
+            if entry.write_lock.has_owner() or entry.read_lock.snapshot()["active_leases"] or (locked and not force):
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
             if locked:
@@ -764,11 +930,13 @@ class L1Manager:
                 "store/prefetch operations — use with caution.",
                 len(self._objects),
             )
-            all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            all_keys = [key for key, entry in self._objects.items()
+                        if not entry.write_lock.has_owner() and not entry.read_lock.snapshot()["active_leases"]]
+            all_memory_objs = [self._objects[key].memory_obj for key in all_keys]
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            for key in all_keys:
+                del self._objects[key]
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -778,8 +946,8 @@ class L1Manager:
                 )
             )
             logger.info(
-                "L1Manager: cleared %d objects, 0 remaining.",
-                len(all_keys),
+                "L1Manager: cleared %d objects, %d owned objects retained.",
+                len(all_keys), len(self._objects),
             )
             return
 

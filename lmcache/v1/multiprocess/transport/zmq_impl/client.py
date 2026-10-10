@@ -6,6 +6,7 @@ from typing import Any
 
 # First Party
 from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey, LookupSessionRef
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -27,6 +28,11 @@ class ZmqMultiprocessClient(RequestClient):
 
     def __init__(self, message_queue_client: MessageQueueClient) -> None:
         self._message_queue_client = message_queue_client
+        self._lookup_generation_supported = False
+
+    def configure_capabilities(self, capabilities) -> None:
+        """Apply the latest server handshake; never infer support from version."""
+        self._lookup_generation_supported = "lookup_generation_v1" in capabilities
 
     def register_kv_cache(
         self,
@@ -162,6 +168,27 @@ class ZmqMultiprocessClient(RequestClient):
             RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT, instance_id
         )
 
+    def shm_v2_handshake(self,instance_id):
+        return self._call(RequestType.SHM_V2_HANDSHAKE,instance_id)
+
+    def shm_v2_prepare_store(self,key,instance_id,ref):
+        return self._call(RequestType.SHM_V2_PREPARE_STORE,key,instance_id,ref)
+
+    def shm_v2_commit_store(self,instance_id,ref):
+        return self._call(RequestType.SHM_V2_COMMIT_STORE,instance_id,ref)
+
+    def shm_v2_prepare_retrieve(self,key,instance_id,ref):
+        return self._call(RequestType.SHM_V2_PREPARE_RETRIEVE,key,instance_id,ref)
+
+    def shm_v2_commit_retrieve(self,instance_id,ref):
+        return self._call(RequestType.SHM_V2_COMMIT_RETRIEVE,instance_id,ref)
+
+    def shm_v2_abort_store(self,instance_id,ref):
+        return self._call(RequestType.SHM_V2_ABORT_STORE,instance_id,ref)
+
+    def shm_v2_ack(self,instance_id,ref):
+        return self._call(RequestType.SHM_V2_ACK,instance_id,ref)
+
     def prepare_store(self, key: Any, instance_id: int) -> MessagingFuture[Any]:
         """Prepare an engine-driven store."""
         return self._call(RequestType.PREPARE_STORE, key, instance_id)
@@ -292,6 +319,13 @@ class ZmqMultiprocessClient(RequestClient):
     def _call(
         self, request_type: RequestType, *request_payloads: Any
     ) -> MessagingFuture[Any]:
+        tagged = any(
+            isinstance(payload, LookupSessionRef)
+            or (isinstance(payload, IPCCacheServerKey) and bool(payload.lookup_id))
+            for payload in request_payloads
+        )
+        if tagged and not self._lookup_generation_supported:
+            raise RuntimeError("MPServer has not negotiated lookup_generation_v1")
         return self._message_queue_client.submit_request(
             request_type,
             list(request_payloads),

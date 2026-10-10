@@ -18,6 +18,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
+    LookupSessionRef,
     KVCache,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -26,6 +27,8 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
+
+from lmcache.v1.multiprocess.shm_wire import ShmTransferRef, ShmRegistrationIdentity
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
@@ -48,6 +51,13 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "SHM_V2_HANDSHAKE",
+    "SHM_V2_PREPARE_STORE",
+    "SHM_V2_COMMIT_STORE",
+    "SHM_V2_PREPARE_RETRIEVE",
+    "SHM_V2_COMMIT_RETRIEVE",
+    "SHM_V2_ACK",
+    "SHM_V2_ABORT_STORE",
 ]
 
 # Type alias for cache keys
@@ -62,6 +72,13 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         Dictionary mapping request names to their protocol definitions
     """
     return {
+        "SHM_V2_HANDSHAKE": ProtocolDefinition(payload_classes=[int], response_class=ShmRegistrationIdentity, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_PREPARE_STORE": ProtocolDefinition(payload_classes=[KeyType, int, ShmTransferRef], response_class=PrepareStoreResponse, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_COMMIT_STORE": ProtocolDefinition(payload_classes=[int, ShmTransferRef], response_class=bool, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_PREPARE_RETRIEVE": ProtocolDefinition(payload_classes=[KeyType, int, ShmTransferRef], response_class=PrepareRetrieveResponse, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_COMMIT_RETRIEVE": ProtocolDefinition(payload_classes=[int, ShmTransferRef], response_class=bool, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_ABORT_STORE": ProtocolDefinition(payload_classes=[int, ShmTransferRef], response_class=bool, handler_type=HandlerType.BLOCKING),
+        "SHM_V2_ACK": ProtocolDefinition(payload_classes=[int, ShmTransferRef], response_class=int, handler_type=HandlerType.BLOCKING),
         # Register KV Cache
         # Payload:
         #   - instance_id: int - Unique identifier for the engine instance
@@ -176,7 +193,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - request_id: str - The external request ID passed in the lookup key
         # Returns: int | None - Chunk count when done, None if still in progress
         "QUERY_PREFETCH_STATUS": ProtocolDefinition(
-            payload_classes=[str],
+            payload_classes=[str | LookupSessionRef],
             response_class=int | None,
             handler_type=HandlerType.BLOCKING,
         ),
@@ -186,7 +203,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - timeout: float - Max seconds to wait for the prefetch to finish
         # Returns: int | None - Chunk count when done, None if the wait timed out
         "WAIT_PREFETCH_STATUS": ProtocolDefinition(
-            payload_classes=[str, float],
+            payload_classes=[str | LookupSessionRef, float],
             response_class=int | None,
             handler_type=HandlerType.BLOCKING,
         ),
@@ -195,7 +212,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - request_id: str - The external request ID passed in the lookup key
         # Returns: int | None - Chunk count if lookup is done, None if still in progress
         "QUERY_PREFETCH_LOOKUP_HITS": ProtocolDefinition(
-            payload_classes=[str],
+            payload_classes=[str | LookupSessionRef],
             response_class=int | None,
             handler_type=HandlerType.BLOCKING,
         ),
@@ -216,7 +233,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - request_id: str - Request ID of the session to end
         # Returns: None
         "END_SESSION": ProtocolDefinition(
-            payload_classes=[str],
+            payload_classes=[str | LookupSessionRef],
             response_class=None,
             handler_type=HandlerType.BLOCKING,
         ),

@@ -57,6 +57,9 @@ async def healthcheck(request: Request) -> Any:
             },
         )
 
+    if not getattr(engine, "rpc_transport_healthy", True):
+        return JSONResponse(status_code=503, content={
+            "status": "unhealthy", "reason": "RPC transport is not running"})
     return {"status": "healthy"}
 
 

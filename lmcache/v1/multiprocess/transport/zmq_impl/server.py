@@ -177,6 +177,13 @@ def get_zmq_handler_specs(module: EngineModule) -> list[HandlerSpec]:
         ]
     if isinstance(module, EngineDrivenTransferModule):
         return [
+            HandlerSpec(RequestType.SHM_V2_HANDSHAKE, module.shm_v2_handshake, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_PREPARE_STORE, module.shm_v2_prepare_store, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_COMMIT_STORE, module.shm_v2_commit_store, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_PREPARE_RETRIEVE, module.shm_v2_prepare_retrieve, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_COMMIT_RETRIEVE, module.shm_v2_commit_retrieve, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_ABORT_STORE, module.shm_v2_abort_store, ThreadPoolType.NORMAL),
+            HandlerSpec(RequestType.SHM_V2_ACK, module.shm_v2_ack, ThreadPoolType.NORMAL),
             HandlerSpec(
                 RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT,
                 module.register_kv_cache_engine_driven_context,
@@ -275,9 +282,14 @@ def build_zmq_request_server(
     Returns:
         Configured, but not yet started, ZMQ message queue server.
     """
+    from lmcache.v1.multiprocess.admission_config import load_admission_config
+    admission = load_admission_config(mp_config.resource_limits_json)
     server = MessageQueueServer(
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=zmq.Context.instance(),
+        frame_limits=admission.frame_limits if admission else None,
+        request_budget=admission.rpc_budget if admission else None,
+        response_limits=admission.response_limits if admission else None,
     )
     all_specs = [spec for module in modules for spec in get_zmq_handler_specs(module)]
     for spec in all_specs:

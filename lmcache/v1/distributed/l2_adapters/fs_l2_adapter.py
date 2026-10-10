@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.internal_api import (
         L1MemoryDesc,
+        L2AdapterListener,
     )
     from lmcache.v1.memory_management import MemoryObj
 
@@ -170,6 +171,8 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
 
     Fields:
     - base_path: directory for storing KV cache files.
+    - max_capacity_bytes: node-local capacity in bytes; 0 disables the bound.
+      A positive bound requires exclusive ownership of this directory.
     - relative_tmp_dir: optional relative sub-dir for
       temp files (same as fs_connector_relative_tmp_dir).
     """
@@ -180,11 +183,16 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
         relative_tmp_dir: Optional[str] = None,
         read_ahead_size: Optional[int] = None,
         use_odirect: bool = False,
+        max_capacity_bytes: int = 0,
     ):
         """Initialize FSL2AdapterConfig.
 
         Args:
             base_path: Directory for storing KV cache files.
+            max_capacity_bytes: Non-negative byte budget. Positive budgets
+                require one cooperating adapter per directory. Existing files
+                are counted on startup and evicted by the L2 controller.
+                New writes that exceed the budget return a failed store result.
             relative_tmp_dir: Relative sub-dir under
                 base_path for temp files during writes.
             read_ahead_size: If set, trigger filesystem
@@ -195,6 +203,9 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
                 Requires buffer sizes aligned to the
                 filesystem block size.
         """
+        if type(max_capacity_bytes) is not int or max_capacity_bytes < 0:
+            raise ValueError("max_capacity_bytes must be a non-negative integer")
+        self.max_capacity_bytes = max_capacity_bytes
         self.base_path = base_path
         self.relative_tmp_dir = relative_tmp_dir
         self.read_ahead_size = read_ahead_size
@@ -221,6 +232,7 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             relative_tmp_dir=relative_tmp_dir,
             read_ahead_size=read_ahead_size,
             use_odirect=use_odirect,
+            max_capacity_bytes=d.get("max_capacity_bytes", 0),
         )
 
     @classmethod
@@ -235,6 +247,8 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             "- read_ahead_size (int): trigger fs "
             "readahead by reading this many bytes first "
             "(optional)\n"
+            "- max_capacity_bytes (int): node-local byte budget, 0 means "
+            "unbounded; positive values require exclusive directory ownership\n"
             "- use_odirect (bool): bypass page cache "
             "via O_DIRECT (optional, default false)"
         )
@@ -256,7 +270,10 @@ class FSL2Adapter(L2AdapterInterface):
     _DELETE_CONCURRENCY = 64
 
     def __init__(self, config: FSL2AdapterConfig):
-        super().__init__()
+        super().__init__(max_capacity_bytes=config.max_capacity_bytes)
+        self._inventory_lock = threading.RLock()
+        self._known_files: dict[ObjectKey, int] = {}
+        self._mutation_lock = asyncio.Lock()
         self._config = config
         base = config.base_path
         self._base_path = Path(base)
@@ -269,7 +286,8 @@ class FSL2Adapter(L2AdapterInterface):
         if config.relative_tmp_dir is not None:
             self._relative_tmp_dir = Path(config.relative_tmp_dir)
             if (
-                self._relative_tmp_dir.is_absolute()
+                self._relative_tmp_dir in (Path(""), Path("."))
+                or self._relative_tmp_dir.is_absolute()
                 or ".." in self._relative_tmp_dir.parts
             ):
                 raise ValueError("Invalid relative_tmp_dir: " + config.relative_tmp_dir)
@@ -284,6 +302,50 @@ class FSL2Adapter(L2AdapterInterface):
         if self._use_odirect:
             stat = os.statvfs(self._base_path)
             self._os_disk_bs = stat.f_bsize
+
+        # Capacity accounting is node-local. Unbounded adapters may share a
+        # directory, but cannot coexist with a capacity-managed owner.
+        import fcntl
+
+        lease_path = self._base_path / ".lmcache-capacity.lock"
+        fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        lease = os.fdopen(fd, "a+b")
+        try:
+            mode = fcntl.LOCK_EX if config.max_capacity_bytes else fcntl.LOCK_SH
+            fcntl.flock(lease.fileno(), mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lease.close()
+            raise RuntimeError("Capacity-managed FS directory already has an owner") from None
+        except BaseException:
+            lease.close()
+            raise
+        self._directory_lease = lease
+
+        # Only an exclusive capacity owner may remove abandoned writes.
+        # Never remove unrelated files or follow symlinks in the cache directory.
+        if config.max_capacity_bytes:
+            if self._relative_tmp_dir is None:
+                temporary = self._base_path.glob("*.tmp")
+            else:
+                temporary_dir = self._base_path / self._relative_tmp_dir
+                if temporary_dir.is_symlink():
+                    self._directory_lease.close()
+                    raise ValueError("Capacity-managed temporary directory must not be a symlink")
+                temporary = temporary_dir.glob("*.data")
+            for entry in temporary:
+                name = entry.with_suffix(_FILE_EXT).name
+                if _filename_to_object_key(name) is not None and entry.is_file() and not entry.is_symlink():
+                    entry.unlink(missing_ok=True)
+
+        # Rebuild usage before the controller registers its eviction listener.
+        for entry in self._base_path.glob("*.data"):
+            key = _filename_to_object_key(entry.name)
+            if key is None or entry.is_symlink() or not entry.is_file():
+                continue
+            try:
+                self._notify_keys_stored([key], [entry.stat().st_size])
+            except FileNotFoundError:
+                continue
 
         self._store_efd = create_event_notifier()
         self._lookup_efd = create_event_notifier()
@@ -408,12 +470,23 @@ class FSL2Adapter(L2AdapterInterface):
     # Status Interface
     # ------------------------------------------------------------------
 
+    def register_listener(self, listener: L2AdapterListener) -> None:
+        """Register a listener and replay the existing inventory atomically."""
+        with self._inventory_lock:
+            super().register_listener(listener)
+            if self._known_files:
+                listener.on_l2_keys_stored(
+                    list(self._known_files), list(self._known_files.values())
+                )
+
     def report_status(self) -> dict:
         """Return a status dict for the FS L2 adapter."""
         return {
             "is_healthy": self._loop_thread.is_alive(),
             "type": "FSL2Adapter",
             "base_path": str(self._base_path),
+            "max_capacity_bytes": self._config.max_capacity_bytes,
+            "bytes_used": self.get_usage().total_bytes_used,
             "use_odirect": self._use_odirect,
             "event_loop_alive": self._loop_thread.is_alive(),
         }
@@ -444,15 +517,6 @@ class FSL2Adapter(L2AdapterInterface):
         except Exception as e:
             logger.warning("FSL2Adapter delete failed: %s", e)
             return
-        if deleted_keys:
-            self._notify_keys_deleted(deleted_keys, deleted_sizes)
-
-    # ``get_usage()`` is inherited from ``L2AdapterInterface``. The base
-    # class maintains byte totals via ``_notify_keys_stored`` /
-    # ``_notify_keys_deleted``, but the FS adapter declares no max capacity
-    # (default 0) so ``supports_global_eviction`` returns ``False`` and
-    # ``usage_fraction == -1.0`` — the eviction controller treats this as
-    # "no eviction signal" and skips the adapter entirely.
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -484,6 +548,9 @@ class FSL2Adapter(L2AdapterInterface):
         self._store_efd.close()
         self._lookup_efd.close()
         self._load_efd.close()
+        if self._directory_lease is not None:
+            self._directory_lease.close()
+            self._directory_lease = None
         logger.info("FSL2Adapter closed")
 
     # ------------------------------------------------------------------
@@ -493,6 +560,21 @@ class FSL2Adapter(L2AdapterInterface):
     def _run_event_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        with self._inventory_lock:
+            fresh = [(k, size) for k, size in zip(keys, sizes, strict=True)
+                     if k not in self._known_files]
+            for key, size in fresh:
+                self._known_files[key] = size
+            if fresh:
+                super()._notify_keys_stored([k for k, _ in fresh], [v for _, v in fresh])
+
+    def _notify_keys_deleted(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        with self._inventory_lock:
+            removed = [(k, self._known_files.pop(k)) for k in keys if k in self._known_files]
+            if removed:
+                super()._notify_keys_deleted([k for k, _ in removed], [v for _, v in removed])
 
     def _get_next_task_id(self) -> L2TaskId:
         tid = self._next_task_id
@@ -598,6 +680,12 @@ class FSL2Adapter(L2AdapterInterface):
     # ---- store ----------------------------------------------------------
 
     async def _execute_store(
+        self, keys: list[ObjectKey], objects: list[MemoryObj], task_id: L2TaskId
+    ) -> None:
+        async with self._mutation_lock:
+            await self._execute_store_serial(keys, objects, task_id)
+
+    async def _execute_store_serial(
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
@@ -616,6 +704,11 @@ class FSL2Adapter(L2AdapterInterface):
                     continue
                 buf = obj.byte_array
                 size = len(buf)
+                capacity = self._config.max_capacity_bytes
+                pending = sum(stored_sizes)
+                if capacity and self.get_usage().total_bytes_used + pending + size > capacity:
+                    success = False
+                    continue
 
                 try:
                     # Decide whether O_DIRECT is usable
@@ -786,6 +879,15 @@ class FSL2Adapter(L2AdapterInterface):
     # ---- delete ---------------------------------------------------------
 
     async def _execute_delete(
+        self, keys: list[ObjectKey]
+    ) -> tuple[list[ObjectKey], list[int]]:
+        async with self._mutation_lock:
+            keys, sizes = await self._execute_delete_serial(keys)
+            if keys:
+                self._notify_keys_deleted(keys, sizes)
+            return keys, sizes
+
+    async def _execute_delete_serial(
         self, keys: list[ObjectKey]
     ) -> tuple[list[ObjectKey], list[int]]:
         """Unlink each key's file concurrently; return removed keys + sizes."""

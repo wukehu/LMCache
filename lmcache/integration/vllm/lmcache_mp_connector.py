@@ -4,12 +4,15 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+import json
+import os
 import sys
 
 # Third Party
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
 )
@@ -34,6 +37,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.integration.vllm.pp_namespace import pp_cache_namespace
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.kv_cache_group_edits import (
@@ -502,6 +506,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         server_urls_cfg = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.server_urls", None
         )
+        node_service = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.kubernetes_service", None
+        )
+        if node_service:
+            if server_urls_cfg:
+                raise ValueError("Specify Kubernetes MP discovery or server_urls, not both")
+            from lmcache.integration.vllm.kubernetes_pp import discover_pp_endpoints
+
+            server_urls_cfg = discover_pp_endpoints(
+                node_service, vllm_config.parallel_config.nnodes,
+                node_endpoints=json.loads(os.environ["LMCACHE_MP_NODE_ENDPOINTS"]),
+            )
         if server_urls_cfg:
             if isinstance(server_urls_cfg, list):
                 server_urls = [u.strip() for u in server_urls_cfg if u.strip()]
@@ -551,24 +567,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "supported in a follow-up PR."
             )
 
-        # Multi-server + MLA: only TP is supported (no PP).
-        # PP splits layers across nodes, which would cause per-piece
-        # reader counts to vary per (server, pp_stage) pair and break
-        # the single-``tp_size`` LOOKUP / FREE_LOOKUP_LOCKS protocol.
-        # Non-MLA mode is not affected by this restriction.
-        if n_servers > 1:
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            if pp_size > 1:
-                raise ValueError(
-                    "LMCacheMPConnector multi-server mode only supports "
-                    "tensor parallelism (TP), not pipeline parallelism (PP). "
-                    f"Got pp_size={pp_size}."
-                )
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.pp_shared", False
+            )
+            if enabled is not True:
+                raise ValueError("PP requires the paired pp_shared_v1 client/server and lmcache.mp.pp_shared=true")
+            if dp_size != 1 or getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) != 1:
+                raise ValueError("PP shared cache currently requires DP=PCP=1")
+            if any(not url.startswith("tcp://") for url in server_urls):
+                raise ValueError("PP scoped lookup currently requires ZMQ TCP endpoints")
+            mc = vllm_config.model_config
+            pc = vllm_config.parallel_config
+            cache_model_name = pp_cache_namespace(cache_model_name, {
+                "model_config": mc.hf_config.to_dict(),
+                "revision": getattr(mc, "revision", None),
+                "dtype": str(mc.dtype),
+                "cache_dtype": str(vllm_config.cache_config.cache_dtype),
+                "tp": pc.tensor_parallel_size,
+                "pp": pp_size,
+                "layer_partition": os.environ.get("VLLM_PP_LAYER_PARTITION", ""),
+                "block_size": scheduler_block_size,
+            })
 
         zmq_context = zmq.Context.instance()
         parallel_strategy = build_parallel_strategy_from_vllm_config(
             vllm_config, n_servers
         )
+        if pp_size > 1:
+            _ = parallel_strategy.pp_topology
 
         self.dispatcher = None
 
@@ -594,6 +622,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            self._pending_session_ends: set[str] = set()
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
@@ -702,6 +731,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         assert self._connector_metadata is not None
         return self._connector_metadata
 
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
+    ) -> None:
+        # MultiConnector broadcasts the NIXL sibling's engine handshake here.
+        # LMCache MP has no engine-to-engine handshake: GPU registration and
+        # PP layout validation belong to its own MP adapters. Do not feed a
+        # sibling's metadata into the base class's PP1-only compatibility shim.
+        return None
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Initialize with the KV caches. Useful for pre-registering the
@@ -757,6 +795,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 
+        lookup_ids = []
         request_ids = []
         ops = []
         cache_salts = []
@@ -766,6 +805,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if meta.direction != "RETRIEVE":
                 continue
             request_ids.append(meta.request_id)
+            lookup_ids.append(meta.lookup_id)
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
             request_configs_list.append(meta.request_configs)
@@ -781,6 +821,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             event,
             cache_salts=cache_salts,
             request_configs_list=request_configs_list,
+            lookup_ids=lookup_ids,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1051,6 +1092,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
         )
+        tracker.lookup_id = getattr(self.scheduler_adapter, "_lookup_ids", {}).get(
+            request.request_id, ""
+        )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
@@ -1232,6 +1276,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 connectors output.
         """
         if not self.lazy_offload:
+            # These IDs have passed the engine's all-rank completion aggregation.
+            # A cancelled in-flight retrieve can finish via recving only.
+            completed = set(connector_output.finished_sending or ())
+            completed.update(connector_output.finished_recving or ())
+            for req_id in completed & self._pending_session_ends:
+                self.scheduler_adapter.end_session(req_id)
+                self.scheduler_adapter.cleanup_lookup_result(req_id)
+                self._pending_session_ends.remove(req_id)
             return
         if not self._gpu_block_pool:
             raise ValueError("Lazy offload is enabled but gpu block pool is not binded")
@@ -1284,15 +1336,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
 
+        # Until retrieve metadata is emitted, this request still owns the
+        # lookup's read reservations on the scheduler side. After emission,
+        # worker completion owns cleanup and cancellation must not unlock it.
+        unclaimed_lookup = None
+        tracker = self.request_trackers.get(request.request_id)
+        if tracker is not None and tracker.state in (
+            LMCacheMPRequestState.PREFETCHING,
+            LMCacheMPRequestState.WAITING_FOR_LOAD,
+        ):
+            waiting = tracker.state == LMCacheMPRequestState.WAITING_FOR_LOAD
+            chunk_size = self.scheduler_adapter.lmcache_tokens_per_chunk
+            unclaimed_lookup = (
+                tracker.get_token_ids(),
+                (tracker.num_vllm_hit_tokens // chunk_size) * chunk_size if waiting else 0,
+                tracker.num_lmcache_hit_tokens if waiting else None,
+                tracker.cache_salt,
+                tracker.request_configs,
+            )
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
 
-        # have not been offloaded, the touch operation in end_session is incorrect
-        # Notify LMCache to end the session for this request
-        self.scheduler_adapter.end_session(request.request_id)
-        # Drop lookup state for a request aborted before its lookup was
-        # consumed (update_state_after_alloc never ran for it).
-        self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+        if self.lazy_offload or unclaimed_lookup is not None:
+            self.scheduler_adapter.end_session(request.request_id, unclaimed_lookup)
+            self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+        else:
+            # Engine request completion is not a STORE barrier: a later PP
+            # stage may still be submitting its final STORE. Keep generation
+            # and messaging ownership until aggregated worker completion.
+            self._pending_session_ends.add(request.request_id)
 
         if self.lazy_offload:
             self._pending_store.mark_req_finished(request.request_id)

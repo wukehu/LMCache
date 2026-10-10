@@ -193,6 +193,7 @@ class InFlightPrefetchRequest:
     request_id: PrefetchRequestId
     keys: list[ObjectKey]
     phase: PrefetchPhase
+    read_leases: dict | None = None
     num_kv_readers: int = 1
     """Total read locks per key to acquire when transitioning from
     write-locked to read-locked.  Must match the ``num_kv_readers`` of the
@@ -233,6 +234,8 @@ class InFlightPrefetchRequest:
     write_reserved_objs: dict[ObjectKey, "MemoryObj"] = field(default_factory=dict)
     # Key indices found (and read-locked) in L1 when the request starts.
     l1_readlocks: Bitmap = field(default_factory=lambda: Bitmap(0))
+
+    object_layout_descs: dict[ObjectKey, MemoryLayoutDesc] | None = None
 
     group_layout_descs: dict[int, MemoryLayoutDesc] = field(default_factory=dict)
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
@@ -433,7 +436,13 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append((request_id, spec))
-        self._submission_efd.notify()
+            try:
+                # The consumer drains under this same lock. Notification
+                # failure must not leave a job whose caller received no ID.
+                self._submission_efd.notify()
+            except Exception:
+                self._submission_queue.pop()
+                raise
         return request_id
 
     def query_lookup_result(self, request_id: PrefetchRequestId) -> int | None:
@@ -823,12 +832,31 @@ class PrefetchController(StorageControllerInterface):
     # Lookup phase
     # =========================================================================
 
+    @staticmethod
+    def _owned_l1_read_operation(operation, leases, keys, *, release=False, **kwargs):
+        """Carry exact reservations through prefetch acquire and pruning.
+
+        Prefetch releases all readers only before handing objects to workers.
+        Remove completed tokens so a later L2 reload can reserve the same key.
+        """
+        if leases is None:
+            return operation(keys, **kwargs)
+        if not release:
+            return operation(keys, leases=leases, **kwargs)
+        result = operation(keys, leases=leases,
+                           claim_id="prefetch-unhanded", **kwargs)
+        for key, error in result.items():
+            if error == L1Error.SUCCESS:
+                leases.pop(key, None)
+        return result
+
     def _lock_l1_keys(
         self,
         keys: list[ObjectKey],
         num_kv_readers: int,
         policy: TrimPolicy,
         attn_desc: AttnWindowDesc,
+        read_leases: dict | None = None,
     ) -> Bitmap:
         """Read-lock the L1-resident keys the request will hold.
 
@@ -851,7 +879,7 @@ class PrefetchController(StorageControllerInterface):
             Bitmap of the key indices read-locked in L1, after releasing
             out-of-window sliding-window chunks.
         """
-        lock_results = self._l1_manager.reserve_read(keys, read_locks=num_kv_readers)
+        lock_results = self._owned_l1_read_operation(self._l1_manager.reserve_read, read_leases, keys, read_locks=num_kv_readers)
         l1_readlocks = Bitmap(len(keys))
         for i, key in enumerate(keys):
             err, _obj = lock_results[key]
@@ -868,9 +896,7 @@ class PrefetchController(StorageControllerInterface):
         # hit -- won't be read again, so release their locks.
         evictable = l1_readlocks & ~l1_window & within_l1_hit
         if evictable.popcount() > 0:
-            self._l1_manager.finish_read(
-                evictable.gather(keys), read_locks=num_kv_readers
-            )
+            self._owned_l1_read_operation(self._l1_manager.finish_read, read_leases, evictable.gather(keys), read_locks=num_kv_readers, release=True)
             l1_readlocks = l1_readlocks & ~evictable
         return l1_readlocks
 
@@ -882,17 +908,19 @@ class PrefetchController(StorageControllerInterface):
         """Read-lock L1-resident keys, then submit lookup_and_lock to all
         live (non-draining) adapters for a new request."""
         l1_readlocks = self._lock_l1_keys(
-            spec.keys, spec.num_kv_readers, spec.policy, spec.attn_desc
+            spec.keys, spec.num_kv_readers, spec.policy, spec.attn_desc, spec.read_leases
         )
         request = InFlightPrefetchRequest(
             request_id=request_id,
             keys=spec.keys,
             phase=PrefetchPhase.LOOKUP,
+            read_leases=spec.read_leases,
             num_kv_readers=spec.num_kv_readers,
             policy=spec.policy,
             attn_desc=spec.attn_desc,
             mode=spec.mode,
             group_layout_descs=spec.group_layout_descs,
+            object_layout_descs=spec.object_layout_descs,
             l1_readlocks=l1_readlocks,
         )
 
@@ -1000,9 +1028,7 @@ class PrefetchController(StorageControllerInterface):
             request.l1_readlocks = request.l1_readlocks & (
                 retained | l1_fallback_retain
             )
-            self._l1_manager.finish_read(
-                stale.gather(request.keys), read_locks=request.num_kv_readers
-            )
+            self._owned_l1_read_operation(self._l1_manager.finish_read, request.read_leases, stale.gather(request.keys), read_locks=request.num_kv_readers, release=True)
 
         # Step 3 — reserve L1 write buffers for the plan keys.
         # If any failure (OOM or contention or others) happens,
@@ -1070,10 +1096,17 @@ class PrefetchController(StorageControllerInterface):
         # Batch reserve_write by object_group_id so each group uses its own
         # tensor shapes.
         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
-        by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
-        for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
+        # A PP stage can have a different layer count within the same group.
+        by_group = sorted(keys_to_reserve, key=attrgetter("kv_rank", "object_group_id"))
+        for (_, gid), group_iter in groupby(
+            by_group, key=attrgetter("kv_rank", "object_group_id")
+        ):
             group_keys = list(group_iter)
-            gld = request.group_layout_descs[gid]
+            gld = (
+                request.object_layout_descs[group_keys[0]]
+                if request.object_layout_descs is not None
+                else request.group_layout_descs[gid]
+            )
             gr = self._l1_manager.reserve_write(
                 keys=group_keys,
                 is_temporary=[not retention_map[k] for k in group_keys],
@@ -1346,9 +1379,7 @@ class PrefetchController(StorageControllerInterface):
             else:
                 # write-locked -> read-locked; num_kv_readers so each TP
                 # worker gets its own read lock.
-                l1_mgr.finish_write_and_reserve_read(
-                    loaded_keys, read_locks=request.num_kv_readers
-                )
+                self._owned_l1_read_operation(l1_mgr.finish_write_and_reserve_read, request.read_leases, loaded_keys, read_locks=request.num_kv_readers)
 
         # Clean up failed keys
         if failed_keys:
@@ -1395,15 +1426,12 @@ class PrefetchController(StorageControllerInterface):
         )
         if request.mode is PrefetchMode.WARM:
             if request.l1_readlocks.popcount() > 0:
-                l1_mgr.finish_read(
-                    request.l1_readlocks.gather(request.keys),
-                    read_locks=request.num_kv_readers,
-                )
+                self._owned_l1_read_operation(l1_mgr.finish_read, request.read_leases, request.l1_readlocks.gather(request.keys), read_locks=request.num_kv_readers, release=True)
                 request.l1_readlocks = Bitmap(num_keys)
         else:
             released = (result_bitmap & (~retained)).gather(request.keys)
             if released:
-                l1_mgr.finish_read(released, read_locks=request.num_kv_readers)
+                self._owned_l1_read_operation(l1_mgr.finish_read, request.read_leases, released, read_locks=request.num_kv_readers, release=True)
 
         # LRU: the retained keys are the ones this request actually serves;
         # touch them (locking/unlocking never refreshes recency).
@@ -1482,10 +1510,7 @@ class PrefetchController(StorageControllerInterface):
                     l1_mgr.delete(request.write_reserved_keys)
             self._release_l2_locks(request, keep={})
             if request.l1_readlocks.popcount() > 0:
-                l1_mgr.finish_read(
-                    request.l1_readlocks.gather(request.keys),
-                    read_locks=request.num_kv_readers,
-                )
+                self._owned_l1_read_operation(l1_mgr.finish_read, request.read_leases, request.l1_readlocks.gather(request.keys), read_locks=request.num_kv_readers, release=True)
             logger.warning(
                 "Cleaning up in-flight prefetch request %d (%d keys).",
                 request.request_id,

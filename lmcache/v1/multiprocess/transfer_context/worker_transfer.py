@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Protocol, cast
 import os
+from functools import wraps
+from threading import RLock
 
 # Third Party
 import torch
@@ -18,6 +20,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
 from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.multiprocess.mq import RemoteRequestError
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
 from lmcache.v1.multiprocess.transfer_context.base import (
@@ -649,6 +652,16 @@ class LMCacheDrivenTransferContext(TransferContext):
         pass
 
 
+def _engine_operation(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._operation_lock:
+            if self._closing:
+                raise RuntimeError("Engine-driven context is closing")
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class EngineDrivenTransferContext(TransferContext):
     """Engine-driven transfer context for non-CUDA workers.
 
@@ -658,6 +671,10 @@ class EngineDrivenTransferContext(TransferContext):
     """
 
     def __init__(self) -> None:
+        self._operation_lock = RLock()
+        self._closing = False
+        self._device = None
+        self.registration_identity = None
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
@@ -675,6 +692,7 @@ class EngineDrivenTransferContext(TransferContext):
             )
         return self._engine_driven_context
 
+    @_engine_operation
     def register(
         self,
         instance_id: int,
@@ -697,6 +715,7 @@ class EngineDrivenTransferContext(TransferContext):
         ``_single_group_block_ids``).
         """
         del engine_type  # unused on the engine-driven path
+        self._device = next(iter(kv_caches.values())).device
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
         # on the CUDA path. The non-CUDA path is yet to be implemented.
@@ -756,6 +775,13 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name=shm_name,
             pool_size=pool_size,
         )
+        sequence_client = getattr(self._engine_driven_context, "_sequence_client", None)
+        if sequence_client is not None:
+            sequenced = sequence_client(instance_id)
+            if sequenced is not None:
+                self.registration_identity = (
+                    shm_name, pool_size, metadata, sequenced.identity.epoch,
+                )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
             "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
@@ -780,6 +806,31 @@ class EngineDrivenTransferContext(TransferContext):
             )
         return None
 
+    def _try_abort_stopped_store(self, key, instance_id):
+        """One bounded cleanup attempt, only after this caller stopped access."""
+        abort = getattr(self._engine_driven_context, "abort_store", None)
+        if abort is None:return False
+        try:
+            confirmed = abort(key, instance_id, access_complete=True)
+            if not confirmed:
+                logger.warning("STORE cancellation unconfirmed; retaining retry state")
+            return confirmed
+        except Exception:
+            logger.exception("STORE cancellation failed; retaining retry state")
+            return False
+
+    @staticmethod
+    def _confirm_completion(method, *args):
+        try:
+            return method(*args)
+        except (RemoteRequestError, TimeoutError):
+            # Device access has already completed at these call sites. Keep
+            # uncertain protocol ownership for recovery; report a tracked
+            # transfer failure instead of escaping the adapter's future map.
+            logger.exception("Transfer completion rejected or unavailable")
+            return False
+
+    @_engine_operation
     def submit_store(
         self,
         _request_id: str,
@@ -797,34 +848,65 @@ class EngineDrivenTransferContext(TransferContext):
             )
 
         torch_dev.synchronize()
-        result = self._engine_driven_context.prepare_store(key, instance_id)
+        try:
+            result = self._engine_driven_context.prepare_store(key, instance_id)
+        except TimeoutError:
+            logger.exception("STORE prepare timed out; attempting cancellation before buffer export")
+            self._try_abort_stopped_store(key, instance_id)
+            failed: MessagingFuture[bool] = MessagingFuture()
+            failed.set_result(False)
+            return failed
         out_buffers, chunk_indices = result if result is not None else (None, None)
-        # All chunks already in cache — nothing to gather or commit.
+        # An empty gather still owns a protocol operation (including V2 ACK).
         if chunk_indices is not None and len(chunk_indices) == 0:
+            ok = self._confirm_completion(self._engine_driven_context.commit_store, key, instance_id, [])
             future: MessagingFuture[bool] = MessagingFuture()
-            future.set_result(True)
+            future.set_result(ok)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+        try:
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception("STORE gather failed; waiting for outstanding device access")
+            # Failure here leaves ownership intact: an uncertain DMA must never
+            # be followed by abort/free. Only a successful fence permits abort.
+            torch_dev.synchronize()
+            self._try_abort_stopped_store(key, instance_id)
+            failed: MessagingFuture[bool] = MessagingFuture()
+            failed.set_result(False)
+            return failed
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
         # commit_store serializes immediately. Either way the copies must be
         # complete first, so this is unconditional -- guarding it on out_buffers
         # left the pickle path serializing a buffer still being written.
         torch_dev.synchronize()
-        ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+        ok = self._confirm_completion(self._engine_driven_context.commit_store, key, instance_id, cpu_chunks)
 
         future = MessagingFuture()
         future.set_result(ok)
         return future
 
+    def _try_finish_stopped_read(self, key, instance_id):
+        finish = getattr(self._engine_driven_context, "abandon_retrieve", None)
+        if finish is None:return False
+        try:
+            confirmed = finish(key, instance_id, access_complete=True)
+            if not confirmed:
+                logger.warning("READ abandonment unconfirmed; retaining retry state")
+            return confirmed
+        except Exception:
+            logger.exception("READ abandonment failed; retaining retry state")
+            return False
+
+    @_engine_operation
     def submit_retrieve(
         self,
         _request_id: str,
@@ -842,7 +924,17 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
-        src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
+        try:
+            src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
+        except TimeoutError:
+            # Return a tracked failure so the adapter invalidates target blocks.
+            # No descriptor was delivered to this caller. Recover the exact
+            # ticket before any completion; retain retry identity on uncertainty.
+            logger.exception("RETRIEVE prepare timed out; attempting stopped-read completion")
+            self._try_finish_stopped_read(key, instance_id)
+            failed: MessagingFuture[bool] = MessagingFuture()
+            failed.set_result(False)
+            return failed
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
@@ -861,16 +953,25 @@ class EngineDrivenTransferContext(TransferContext):
             # SHM path: ensure all device writes are complete before releasing
             # the SHM slot (server may immediately reuse it after commit_retrieve).
             torch_dev.synchronize()
-        self._engine_driven_context.commit_retrieve(key, instance_id)
+        completed = self._confirm_completion(self._engine_driven_context.commit_retrieve, key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
-        future.set_result(ok)
+        future.set_result(ok and completed)
         return future
 
     def close(self) -> None:
-        if self._engine_driven_context is not None:
-            self._engine_driven_context.close()
-            self._engine_driven_context = None
+        with self._operation_lock:
+            self._closing = True
+            if self._engine_driven_context is not None:
+                # A failed transfer may have left device work outstanding.
+                # Never unmap until its completion is confirmed. On failure,
+                # retain the context and refuse new work; close can be retried.
+                if self._device is not None and self._device.type != "cpu":
+                    torch_dev.set_device(self._device)
+                if torch_dev.is_available():
+                    torch_dev.synchronize()
+                self._engine_driven_context.close()
+                self._engine_driven_context = None
 
     def flush_inflight_stores(self) -> None:
         pass

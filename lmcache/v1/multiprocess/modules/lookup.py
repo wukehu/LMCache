@@ -2,7 +2,8 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from concurrent.futures import Future
 from functools import partial
 import threading
 import time
@@ -18,13 +19,37 @@ from lmcache.v1.distributed.api import (
     ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
+from lmcache.v1.distributed.storage_manager import UnsubmittedPrefetchError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey, LookupSessionRef
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
+
+
+def planned_payload_bytes(object_layouts):
+    """Logical uncompressed bytes, counted once per selected cache object.
+
+    Python integer multiplication cannot wrap. This is a work reservation,
+    not physical memory usage or compressed transfer bytes.
+    """
+    total = 0
+    for layout in object_layouts.values():
+        if len(layout.shapes) != len(layout.dtypes):
+            raise ValueError("Mismatched layout shapes and dtypes")
+        for shape, dtype in zip(layout.shapes, layout.dtypes):
+            elements = 1
+            for dim in shape:
+                if type(dim) is not int or dim < 0:
+                    raise ValueError("Invalid layout dimension")
+                elements *= dim
+            itemsize = dtype.itemsize
+            if type(itemsize) is not int or itemsize <= 0:
+                raise ValueError("Invalid layout dtype itemsize")
+            total += elements * itemsize
+    return total
 
 
 def resolve_prefetched_obj_keys(
@@ -98,6 +123,18 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    object_keys: tuple[ObjectKey, ...] = ()
+    num_kv_readers: int = 1
+    guard: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    submission_completion: Future | None = field(default=None, repr=False)
+    # Retain destructive query results until handoff or cancellation finishes.
+    completed_result: object | None = field(default=None, repr=False)
+    handoff_completed: bool = False
+    cleanup_failed: bool = False
+    cleanup_keys: tuple[ObjectKey, ...] | None = None
+    cleanup_retry_after: float = 0.0
+    cleanup_retry_delay: float = 0.1
+    lookup_id: str = ""
 
 
 class LookupModule:
@@ -118,6 +155,11 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._cancelled_jobs: dict[int, _PrefetchJob] = {}
+        self._cleanup_condition = threading.Condition(self._prefetch_job_lock)
+        self._cleanup_thread: threading.Thread | None = None
+        self._closed = False
+        ctx.session_manager.destroy_listeners.append(self._session_destroyed)
         self._setup_metrics()
 
     @property
@@ -131,13 +173,29 @@ class LookupModule:
         Returns:
             Dictionary with the count of active prefetch jobs.
         """
-        return {
-            "active_prefetch_jobs": self._active_prefetch_count(),
-        }
+        admission = self._ctx.session_manager.admission_snapshot()
+        with self._prefetch_job_lock:
+            return {
+                **{f"sessions_{name}": value for name, value in admission.items()},
+                "active_prefetch_jobs": len(self._prefetch_jobs) + len(self._cancelled_jobs),
+                "cancelled_prefetch_jobs": len(self._cancelled_jobs),
+                "failed_prefetch_cleanups": sum(job.cleanup_failed for job in self._cancelled_jobs.values()),
+            }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Stop cleanup before context storage closes; never free pending DMA."""
+        listeners = self._ctx.session_manager.destroy_listeners
+        if self._session_destroyed in listeners:
+            listeners.remove(self._session_destroyed)
+        with self._prefetch_job_lock:
+            request_ids = list(self._prefetch_jobs)
+        for request_id in request_ids:
+            self._cancel_prefetch(request_id)
+        with self._cleanup_condition:
+            self._closed = True
+            self._cleanup_condition.notify()
+        if self._cleanup_thread is not None:
+            self._cleanup_thread.join()
 
     # -----------------------------------------------------------------
     # Handlers
@@ -158,6 +216,15 @@ class LookupModule:
             key: Cache key with request_id embedded.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
+        limits = self._ctx.session_manager.request_limits
+        if limits is not None:
+            limits.validate_key(key)
+            limits.validate_expansion(
+                key, self._ctx.chunk_size,
+                self._ctx.layout_desc_registry.find_attn_desc(
+                    key.model_name, key.world_size
+                ).num_object_groups,
+            )
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -172,12 +239,22 @@ class LookupModule:
             )
         )
 
+        worker_layouts = self._ctx.layout_desc_registry.find_worker_group_layout_descs(
+            model_name, world_size
+        )
+        missing_workers = (
+            set(key.lookup_worker_ids) - worker_layouts.keys()
+            if key.lookup_worker_ids is not None
+            else set()
+        )
         layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
-        if layout_desc is None:
+        if layout_desc is None or missing_workers:
             logger.error(
-                "No GPU context found for model %s with world size %d during lookup!",
+                "Incomplete KV layout registration for model %s, world size %d, "
+                "missing PP workers=%s",
                 model_name,
                 world_size,
+                sorted(missing_workers),
             )
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -194,7 +271,8 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
-                    early_exit_reason="no_gpu_context",
+                    lookup_id=key.lookup_id,
+                    early_exit_reason=("missing_pp_layout" if missing_workers else "no_gpu_context"),
                 )
             )
             return
@@ -218,6 +296,7 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    lookup_id=key.lookup_id,
                     early_exit_reason="empty_chunk_hashes",
                 )
             )
@@ -255,9 +334,11 @@ class LookupModule:
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
+        attn_desc = replace(attn_desc, world_size=key.lookup_world_size)
+        session = self._ctx.session_manager.get_or_create_lookup(key)
+        if not session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw)):
+            return
         session.set_tokens(list(key.token_ids))
-        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
@@ -285,36 +366,90 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    lookup_id=key.lookup_id,
                     early_exit_reason="no_group_layout_descs",
                 )
             )
             return
 
-        handle = self._ctx.storage_manager.submit_prefetch_task(
-            PrefetchRequestSpec(
-                keys=obj_keys,
-                group_layout_descs=group_layout_descs,
-                num_kv_readers=num_kv_readers,
-                attn_desc=attn_desc,
-            ),
-            external_request_id=key.request_id,
+        ranked_layouts = {
+            ObjectKey.ComputeKVRank(world_size, worker, world_size, worker): layouts
+            for worker, layouts in worker_layouts.items()
+        }
+        object_layouts = {
+            obj: ranked_layouts.get(obj.kv_rank, group_layout_descs)[obj.object_group_id]
+            for obj in obj_keys
+        }
+        spec = PrefetchRequestSpec(
+            keys=obj_keys,
+            group_layout_descs=group_layout_descs,
+            object_layout_descs=object_layouts,
+            read_leases={} if key.lookup_id else None,
+            num_kv_readers=num_kv_readers,
+            attn_desc=attn_desc,
         )
-        self._register_prefetch_job(
-            _PrefetchJob(
-                handle=handle,
-                world_size=key.world_size,
-                request_id=key.request_id,
-                requested_tokens=requested_tokens,
-                num_object_groups=attn_desc.num_object_groups,
-                attn_desc=attn_desc,
-                model_name=model_name,
-                cache_salt=key.cache_salt,
+        # Allocate the task, guard and key snapshot before storage can accept
+        # asynchronous work. The placeholder handle never escapes this method.
+        job = _PrefetchJob(
+            handle=PrefetchHandle(-1, key.request_id, (), 0, len(obj_keys), time.monotonic()),
+            world_size=key.lookup_world_size,
+            request_id=key.request_id,
+            requested_tokens=requested_tokens,
+            num_object_groups=attn_desc.num_object_groups,
+            attn_desc=attn_desc,
+            model_name=model_name,
+            cache_salt=key.cache_salt,
+            lookup_id=key.lookup_id,
+            object_keys=tuple(obj_keys),
+            num_kv_readers=num_kv_readers,
+        )
+        # Keep accounting optional until all direct/legacy paths and config
+        # have explicit admission coverage. Reserve before native submission.
+        payload_bytes = (
+            planned_payload_bytes(object_layouts)
+            if session._budget_account is not None else 0
+        )
+        submission = session.begin_owned_submission(
+            key, payload_bytes=payload_bytes
+        ) if key.lookup_id else None
+        if key.lookup_id and submission is None:
+            return
+        job.submission_completion = submission
+        try:
+            handle = self._ctx.storage_manager.submit_prefetch_task(
+                spec, external_request_id=key.request_id,
             )
-        )
+        except UnsubmittedPrefetchError:
+            if submission is not None:
+                try:
+                    session.adopt_failed_submission(
+                        key, spec.read_leases,
+                        self._ctx.storage_manager.owned_reads_pending,
+                        lambda: self._release_retired_reads(session),
+                    )
+                    self._ctx.session_manager.remove_if_lookup(key.request_id, key.lookup_id)
+                finally:
+                    submission.set_result(None)
+            raise
+        # Successful submission stays pinned until ownership is published to
+        # its session or cancelled cleanup is confirmed. Unknown exceptions
+        # keep the admission slot rather than assume asynchronous work stopped.
+        job.handle = handle
+        try:
+            self._register_prefetch_job(job)
+        except Exception:
+            # Registration may fail before or after publication, or race with
+            # query/retirement. Serialize with result handoff and retain the
+            # exact accepted task until asynchronous completion is confirmed.
+            with job.guard:
+                if not job.handoff_completed and (submission is None or not submission.done()):
+                    self._queue_cancelled_job(job, detached=True)
+            self._ctx.session_manager.remove_if_lookup(key.request_id, key.lookup_id)
+            raise
 
     def query_prefetch_lookup_hits(
         self,
-        request_id: str,
+        request_id: str | LookupSessionRef,
     ) -> int | None:
         """Query the number of hits for a prefetch request before it's finished.
 
@@ -326,10 +461,13 @@ class LookupModule:
             done. None if the lookup phase is still in progress. 0 if the
             request_id is unknown (already completed and consumed, or invalid).
         """
+        ref = request_id
+        expected_lookup_id = ref.lookup_id if isinstance(ref, LookupSessionRef) else ""
+        request_id = ref.request_id if isinstance(ref, LookupSessionRef) else ref
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
 
-        if job is None:
+        if job is None or job.lookup_id != expected_lookup_id:
             logger.warning(
                 "Prefetch job for request %s not found (already completed or invalid)",
                 request_id,
@@ -341,7 +479,7 @@ class LookupModule:
 
     def query_prefetch_status(
         self,
-        request_id: str,
+        request_id: str | LookupSessionRef,
     ) -> int | None:
         """Poll the status of a prefetch job by request_id.
 
@@ -358,16 +496,38 @@ class LookupModule:
             0 if the request_id is unknown (already completed and consumed,
             or invalid).
         """
+        ref = request_id
+        expected_lookup_id = ref.lookup_id if isinstance(ref, LookupSessionRef) else ""
+        request_id = ref.request_id if isinstance(ref, LookupSessionRef) else ref
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
-        if job is None:
+        if job is None or job.lookup_id != expected_lookup_id:
             logger.warning(
                 "Prefetch job for request %s not found (already completed or invalid)",
                 request_id,
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
+        with job.guard:
+            with self._prefetch_job_lock:
+                if self._prefetch_jobs.get(request_id) is not job:
+                    return 0
+            # A TTL cleanup may already have removed the session. Never
+            # resurrect it merely because a result arrived late.
+            session = self._ctx.session_manager.get(request_id)
+            if session is None and job.object_keys:
+                self._queue_cancelled_job(job)
+                return 0
+            return self._consume_prefetch_status(job, session)
+
+    def _query_job_result(self, job):
+        if job.completed_result is None:
+            job.completed_result = self._ctx.storage_manager.query_prefetch_status(job.handle)
+        return job.completed_result
+
+    def _consume_prefetch_status(self, job, session) -> int | None:
+        request_id = job.request_id
+        found = self._query_job_result(job)
         if found is None:
             return None
 
@@ -384,51 +544,71 @@ class LookupModule:
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
-        session = self._ctx.session_manager.get_or_create(job.request_id)
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-        )
+        if session is not None:
+            leases = job.handle.read_leases
+            if leases is not None:
+                lookup_key = session.lookup_ipc_key
+                if (lookup_key is None or lookup_key.lookup_id != job.lookup_id
+                        or not session.record_owned_prefetch_result(
+                            lookup_key, found_count,
+                            tuple(range(job.attn_desc.num_object_groups)), leases,
+                            release_check=self._ctx.storage_manager.owned_reads_pending,
+                            cleanup_retry=lambda: self._release_retired_reads(session))):
+                    self._queue_cancelled_job(job)
+                    return 0
+            else:
+                session.record_prefetch_result(
+                    found_count,
+                    tuple(range(job.attn_desc.num_object_groups)),
+                )
 
-        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
-        # object group's window rule, so L2's contribution is however much
-        # further ``found_count`` reaches -- not a count of L1-resident keys.
-        l1_chunks = job.handle.l1_hit_chunks
-        if l1_chunks > found_count:
-            logger.error(
-                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
-                l1_chunks,
-                found_count,
-                request_id,
-            )
-            l1_chunks = found_count
-        l2_chunks = found_count - l1_chunks
-
-        self._ctx.event_bus.publish(
-            Event(
-                event_type=EventType.MP_LOOKUP_PREFETCH_END,
-                session_id=job.request_id,
-                metadata={
-                    "found_count": found_count,
-                    "requested_tokens": job.requested_tokens,
-                    "hit_tokens": found_count * self._ctx.chunk_size,
-                    "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
-                    "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
-                    "early_exit_reason": job.early_exit_reason,
-                    "model_name": job.model_name,
-                    "cache_salt": job.cache_salt,
-                },
-            )
-        )
-
+        # Commit the ownership handoff before any metrics or logging. Once
+        # the session owns these leases, observer failures must not leave a
+        # pending submission or let a retry publish the same leases again.
+        job.handoff_completed = True
         with self._prefetch_job_lock:
             self._prefetch_jobs.pop(request_id, None)
+        if job.submission_completion is not None:
+            job.submission_completion.set_result(None)
+
+        try:
+            # L2 contributes only the prefix beyond the L1 hit boundary.
+            l1_chunks = job.handle.l1_hit_chunks
+            if l1_chunks > found_count:
+                logger.error(
+                    "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
+                    l1_chunks, found_count, request_id,
+                )
+                l1_chunks = found_count
+            l2_chunks = found_count - l1_chunks
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                    session_id=job.request_id,
+                    metadata={
+                        "found_count": found_count,
+                        "requested_tokens": job.requested_tokens,
+                        "hit_tokens": found_count * self._ctx.chunk_size,
+                        "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
+                        "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
+                        "early_exit_reason": job.early_exit_reason,
+                        "model_name": job.model_name,
+                        "cache_salt": job.cache_salt,
+                    },
+                )
+            )
+        except Exception:
+            try:
+                logger.exception("Prefetch completion event failed: %s", request_id)
+            except Exception:
+                # A failed log sink cannot reverse a committed handoff.
+                pass
 
         return found_count
 
     def wait_prefetch_status(
         self,
-        request_id: str,
+        request_id: str | LookupSessionRef,
         timeout: float,
     ) -> int | None:
         """Block until a prefetch job completes, then return its chunk count.
@@ -446,9 +626,12 @@ class LookupModule:
             Chunk count (int) when done, None if the wait timed out, 0 if the
             request_id is unknown (already completed and consumed, or invalid).
         """
+        ref = request_id
+        expected_lookup_id = ref.lookup_id if isinstance(ref, LookupSessionRef) else ""
+        request_id = ref.request_id if isinstance(ref, LookupSessionRef) else ref
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
-        if job is None:
+        if job is None or job.lookup_id != expected_lookup_id:
             logger.warning(
                 "Prefetch job for request %s not found (already completed or invalid)",
                 request_id,
@@ -457,7 +640,7 @@ class LookupModule:
 
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
-        return self.query_prefetch_status(request_id)
+        return self.query_prefetch_status(ref)
 
     def free_lookup_locks(
         self,
@@ -483,53 +666,55 @@ class LookupModule:
         if key.start >= key.end:
             return
 
-        hit_chunks = self._ctx.session_manager.get_or_create(
-            key.request_id
-        ).prefetch_hit_chunks
-        if hit_chunks < 0:
-            logger.warning(
-                "free_lookup_locks for request %s before its prefetch result "
-                "was consumed; releasing full-attention groups only",
-                key.request_id,
-            )
-
-        # Release exactly the groups the prefetch locked (std lookup: all;
-        # CB prefix leg: its prefix set) -- releasing an unlocked group
-        # would drop another request's lock on the shared object key.
-        locked_gids = self._ctx.session_manager.get_or_create(
-            key.request_id
-        ).prefetch_locked_gids
-        obj_keys = resolve_prefetched_obj_keys(self._ctx, key, hit_chunks, locked_gids)
+        session = self._ctx.session_manager.get(key.request_id)
+        if session is None:
+            return
+        state = session.prepare_scheduler_release(key)
+        if state is None:
+            return
+        hit_chunks, locked_gids, group_windows, generation = state
+        obj_keys = resolve_prefetched_obj_keys(
+            self._ctx, key, hit_chunks, locked_gids, group_windows
+        )
+        obj_keys = session.claim_scheduler_release(key, generation, obj_keys)
 
         if not obj_keys:
             return
 
+        leases = session.read_lease_snapshot(obj_keys)
         self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys, read_locks=key.require_num_kv_readers()
+            obj_keys, read_locks=key.require_num_kv_readers(),
+            **({"leases": leases, "claim_id": "scheduler-unhanded"}
+               if leases is not None else {})
         )
 
-    def end_session(self, request_id: str) -> None:
+    def end_session(self, request_id: str | LookupSessionRef) -> None:
         """Remove the session for a finished request.
 
         Args:
             request_id: The request ID whose session should be removed.
         """
+        ref = request_id
+        expected_lookup_id = ref.lookup_id if isinstance(ref, LookupSessionRef) else ""
+        request_id = ref.request_id if isinstance(ref, LookupSessionRef) else ref
+        session = self._ctx.session_manager.remove_if_lookup(request_id, expected_lookup_id)
+        # Early-exit lookups may have a job without a session. Match the nonce
+        # before cancelling; a delayed END must never touch a newer generation.
+        self._cancel_prefetch(request_id, expected_lookup_id)
+        if session is None:
+            return
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_VLLM_END_SESSION,
                 metadata={"request_id": request_id},
             )
         )
-        session = self._ctx.session_manager.remove(request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,
                 session_id=request_id,
             )
         )
-        if session is None:
-            logger.warning("Session %s not found, skipping touch", request_id)
-            return
         if session.lookup_ipc_key is None:
             logger.warning(
                 "Session %s has no lookup ipc key, skipping touch",
@@ -594,13 +779,121 @@ class LookupModule:
         return obj_keys
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
+        session = self._ctx.session_manager.get(job.request_id)
+        key = session.lookup_ipc_key if session is not None else None
+        stale = bool(job.object_keys) and (key is None or key.lookup_id != job.lookup_id)
         with self._prefetch_job_lock:
-            self._prefetch_jobs[job.request_id] = job
+            occupied = job.request_id in self._prefetch_jobs
+            if not stale and not occupied:
+                self._prefetch_jobs[job.request_id] = job
+        if stale or occupied:
+            # Storage may already hold reservations. Retire this exact task
+            # without overwriting or cancelling the currently registered task.
+            with job.guard:
+                self._queue_cancelled_job(job, detached=True)
+            return
+        # Session expiry may race with storage submission, before this entry
+        # was visible to the session destroy listener.
+        current = self._ctx.session_manager.get(job.request_id)
+        if job.object_keys and current is not session:
+            self._cancel_prefetch(job.request_id, job.lookup_id)
+
+    def _session_destroyed(self, session) -> None:
+        key = session.lookup_ipc_key
+        self._cancel_prefetch(session.request_id, key.lookup_id if key else "")
+        self._release_retired_reads(session)
+
+    def _release_retired_reads(self, session) -> None:
+        for obj, token, count in session.retired_unhanded_read_plan():
+            self._ctx.storage_manager.finish_read_prefetched(
+                [obj], read_locks=count, leases={obj: token},
+                claim_id="scheduler-unhanded",
+            )
+
+        for obj, token, instance in session.completed_worker_read_plan():
+            self._ctx.storage_manager.finish_read_prefetched(
+                [obj], leases={obj: token}, claim_id=f"worker:{instance}",
+            )
+
+    def _cancel_prefetch(self, request_id: str, expected_lookup_id: str | None = None) -> None:
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+        if job is not None:
+            with job.guard:
+                if expected_lookup_id is not None and job.lookup_id != expected_lookup_id:
+                    return
+                self._queue_cancelled_job(job)
+
+    def _queue_cancelled_job(self, job, detached: bool = False) -> None:
+        # Caller owns job.guard, excluding normal result consumption.
+        with self._cleanup_condition:
+            if not detached and self._prefetch_jobs.get(job.request_id) is not job:
+                return
+            if self._prefetch_jobs.get(job.request_id) is job:
+                del self._prefetch_jobs[job.request_id]
+            self._cancelled_jobs[id(job)] = job
+            if self._cleanup_thread is None:
+                self._cleanup_thread = threading.Thread(
+                    target=self._drain_cancelled, name="lmcache-prefetch-cleanup",
+                    daemon=True,
+                )
+                self._cleanup_thread.start()
+            self._cleanup_condition.notify()
+
+    def _drain_cancelled(self) -> None:
+        while True:
+            with self._cleanup_condition:
+                if not self._cancelled_jobs and not self._closed:
+                    self._cleanup_condition.wait()
+                jobs = list(self._cancelled_jobs.values())
+            for job in jobs:
+                if job.cleanup_failed or time.monotonic() < job.cleanup_retry_after:
+                    continue
+                try:
+                    if job.cleanup_keys is None:
+                        found = self._query_job_result(job)
+                        if found is None:
+                            continue
+                        # The result may be consumed on query. Retain its exact
+                        # keys before release so an owned retry never re-queries.
+                        job.cleanup_keys = tuple(
+                            key for i, key in enumerate(job.object_keys) if found.test(i)
+                        )
+                    keys = list(job.cleanup_keys)
+                    if keys:
+                        self._ctx.storage_manager.finish_read_prefetched(
+                            keys, read_locks=job.num_kv_readers,
+                            **({"leases": job.handle.read_leases,
+                                "claim_id": "cancelled-prefetch-unhanded"}
+                               if job.handle.read_leases is not None else {})
+                        )
+                    if (job.handle.read_leases is not None
+                            and self._ctx.storage_manager.owned_reads_pending(job.handle.read_leases)):
+                        raise RuntimeError("Cancelled prefetch still owns read leases")
+                    with self._cleanup_condition:
+                        self._cancelled_jobs.pop(id(job), None)
+                    if job.submission_completion is not None:
+                        job.submission_completion.set_result(None)
+                except Exception:
+                    if job.handle.read_leases is None:
+                        # Anonymous partial decrements cannot be replayed safely.
+                        job.cleanup_failed = True
+                    else:
+                        job.cleanup_retry_after = time.monotonic() + job.cleanup_retry_delay
+                        job.cleanup_retry_delay = min(60.0, job.cleanup_retry_delay * 2)
+                    logger.exception("Cancelled prefetch cleanup failed: %s", job.request_id)
+            with self._cleanup_condition:
+                if self._closed:
+                    if self._cancelled_jobs:
+                        logger.warning("Closing with %d unconfirmed prefetch cleanups; buffers not released early", len(self._cancelled_jobs))
+                    return
+                if self._cancelled_jobs:
+                    self._cleanup_condition.wait(timeout=0.01)
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""
         with self._prefetch_job_lock:
-            return len(self._prefetch_jobs)
+            return len(self._prefetch_jobs) + len(self._cancelled_jobs)
 
     def _setup_metrics(self) -> None:
         """Register OTel observable gauges for lookup module metrics."""

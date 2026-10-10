@@ -4,6 +4,8 @@
 # Standard
 from collections.abc import Sequence
 import threading
+import os
+import uuid
 
 # First Party
 from lmcache.logging import init_logger
@@ -52,6 +54,8 @@ class ManagementModule:
         experimental_transfer: Sequence[str] = (),
     ) -> None:
         self._ctx = ctx
+        self._server_epoch = uuid.uuid4().hex
+        self._lookup_generation_enabled = os.environ.get("LMCACHE_MP_LOOKUP_GENERATION_V1") == "1"
         self._clear_lock = threading.Lock()
         self._liveness_targets = tuple(liveness_targets)
         self._reap_timeout = worker_reap_timeout_seconds
@@ -110,11 +114,17 @@ class ManagementModule:
                 worker's last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            True for an untracked probe or a registered primary transfer
+            context. False when primary registries no longer know the worker.
         """
         if instance_id is not None:
+            registrations = []
             for target in self._liveness_targets:
-                target.touch_instance(instance_id)
+                registered = target.touch_instance(instance_id)
+                if isinstance(registered, bool):
+                    registrations.append(registered)
+            if registrations:
+                return any(registrations)
         return True
 
     def _reap_cycle(self) -> ThreadRunSummary:
@@ -152,7 +162,11 @@ class ManagementModule:
             The enabled experimental intermediate tensor transfer types.
             See ``lmcache.v1.multiprocess.modules.experimental.__init__``.
         """
-        return list(self._experimental_transfer)
+        return list(self._experimental_transfer) + (["lookup_generation_v1"] if self._lookup_generation_enabled else []) + [
+            "pp_shared_v1", "registration_ping_v1", "rpc_error_v1",
+            f"lookup_replay_ttl_seconds={self._ctx.session_manager.replay_ttl_seconds}",
+            f"server_epoch_v1:{self._server_epoch}"
+        ]
 
     def clear(self) -> None:
         """Clear all stored KV cache data from the storage manager."""

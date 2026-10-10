@@ -32,8 +32,15 @@ from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMet
 # Local
 from .server_transfer import (
     TransferStrategy,
+    OwnedShmRead,
+    finish_owned_shm_read,
+    UncertainShmCommit,
+    OwnedShmWrite,
+    OwnedLegacyShmRead,
+    ShmTransferStrategy,
     create_transfer_strategy,
 )
+from lmcache.v1.multiprocess.shm_wire import ShmTransferRef, ShmRegistrationIdentity
 
 logger = init_logger(__name__)
 
@@ -57,6 +64,8 @@ class EngineDrivenContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    transfer_strategy: TransferStrategy | None = None
+    resources_released: bool = False
 
 
 class EngineDrivenTransferModule(InstanceLivenessTarget):
@@ -70,20 +79,18 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         ctx: The shared engine context.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(self, ctx: MPCacheServerContext, max_shm_transfer_records: int = 65536) -> None:
         self._ctx = ctx
         self._engine_driven_contexts: dict[int, EngineDrivenContextEntry] = {}
         self._strategies: dict[int, TransferStrategy] = {}
         # Guards _engine_driven_contexts and _strategies together (the reaper
-        # mutates them off the MQ main loop). Leaf lock, never held with
-        # _pending_shm_lock.
+        # mutates them off the MQ main loop). Lock order is engine registration
+        # lock, then pending SHM lock, then record-table lock.
         self._lock = threading.Lock()
-        self._pending_shm_writes: dict[
-            tuple[int, IPCCacheServerKey], list[ObjectKey]
-        ] = {}
-        self._pending_shm_reads: dict[
-            tuple[int, IPCCacheServerKey], list[ObjectKey]
-        ] = {}
+        from lmcache.v1.multiprocess.shm_records import ShmRecords
+        self._shm_records = ShmRecords(max_shm_transfer_records)
+        self._pending_shm_writes = self._shm_records.writes
+        self._pending_shm_reads = self._shm_records.reads
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
 
@@ -116,6 +123,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_non_cuda_instance_ids": registered_non_cuda_ids,
             "non_cuda_context_meta": non_cuda_context_meta,
+            "shm_transfer_records": self._shm_records.snapshot(),
         }
 
     def close(self) -> None:
@@ -124,7 +132,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             self._engine_driven_contexts.clear()
             self._strategies.clear()
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool:
         """Refresh the worker's last-seen time and mark it ping-proven.
 
         A no-op if the instance is not tracked.
@@ -138,6 +146,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
                 entry.has_liveness_signal = True
+                return True
+            return False
 
     def tracked_instance_count(self) -> int:
         """Return the number of currently registered non-GPU instances."""
@@ -174,7 +184,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ]
             for iid in stale_ids:
                 entry = self._engine_driven_contexts.pop(iid)
-                self._strategies.pop(iid, None)
+                strategy = self._strategies.pop(iid, None)
+                if hasattr(strategy, "retire_owned_writes"):
+                    strategy.retire_owned_writes()
                 reaped.append((iid, entry))
         for iid, entry in reaped:
             self._release_entry(iid, entry)
@@ -217,35 +229,43 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             return entry, strategy
 
     def _release_entry(self, instance_id: int, entry: EngineDrivenContextEntry) -> None:
+        # Serialize layout reference retirement against replacement registration.
+        # Delayed/repeated cleanup must not decrement a newer registration.
+        with self._lock:
+            if entry.resources_released:
+                return
+            self._release_entry_resources(instance_id, entry)
+            entry.resources_released = True
+
+    def _release_entry_resources(self, instance_id: int, entry: EngineDrivenContextEntry) -> None:
         """Release resources for a popped entry (run outside the lock).
 
-        Sweeps the instance's pending SHM transfers and unregisters its
-        layout descriptor.
+        Quarantines legacy transfers: losing a context does not prove that
+        a client has stopped accessing exported SHM slots.
 
         Args:
             instance_id: The popped instance ID.
             entry: The popped entry.
         """
         with self._pending_shm_lock:
-            stale_writes = [k for k in self._pending_shm_writes if k[0] == instance_id]
-            stale_reads = [k for k in self._pending_shm_reads if k[0] == instance_id]
-            write_obj_keys = [self._pending_shm_writes.pop(k) for k in stale_writes]
-            read_obj_keys = [self._pending_shm_reads.pop(k) for k in stale_reads]
-
-        for obj_keys in write_obj_keys:
-            if obj_keys:
-                self._ctx.storage_manager.finish_write(obj_keys)
-        for obj_keys in read_obj_keys:
-            if obj_keys:
-                self._ctx.storage_manager.finish_read_prefetched(obj_keys)
+            for pending_map in (self._pending_shm_writes, self._pending_shm_reads):
+                for key, reservation in pending_map.items():
+                    if key[0] == instance_id and isinstance(reservation, (OwnedShmWrite, OwnedLegacyShmRead)):
+                        strategy = getattr(entry, "transfer_strategy", None)
+                        if reservation.owner is getattr(strategy, "_registration_token", None) and reservation.state != "committed":
+                            reservation.state = "quarantined"
+                    elif key[0] == instance_id and not isinstance(reservation, (OwnedShmRead, UncertainShmCommit)):
+                        pending_map[key] = UncertainShmCommit(tuple(reservation))
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
 
     @staticmethod
     def _make_transfer_key(
         key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[int, IPCCacheServerKey]:
-        return (instance_id, key)
+    ) -> tuple:
+        # Cache equality deliberately ignores request/lookup identity. Pending
+        # transport operations must not: another request can reuse the same KV.
+        return (instance_id, key.request_id, key.lookup_id, key)
 
     def _resolve_single_group_obj_keys(self, key: IPCCacheServerKey) -> list[ObjectKey]:
         """Resolve object keys for the single object group used by
@@ -269,19 +289,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
-
-        now = time.monotonic()
-        with self._lock:
-            existing = self._engine_driven_contexts.get(payload.instance_id)
-            if existing is not None:
-                existing.last_seen = now
-                logger.info(
-                    "Instance %d already registered (non-GPU); refreshing liveness",
-                    payload.instance_id,
-                )
-                return RegisterEngineDrivenContextResponse(
-                    shm_name=shm_name, pool_size=pool_size
-                )
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -316,6 +323,24 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             block_size=payload.block_size,
             use_mla=payload.use_mla,
         )
+        now = time.monotonic()
+        with self._lock:
+            existing = self._engine_driven_contexts.get(payload.instance_id)
+            if existing is not None:
+                if (
+                    existing.model_name != payload.model_name
+                    or existing.world_size != payload.world_size
+                    or existing.metadata != metadata
+                ):
+                    raise ValueError("registration metadata mismatch for existing instance")
+                existing.last_seen = now
+                logger.info(
+                    "Instance %d already registered (non-GPU); refreshing liveness",
+                    payload.instance_id,
+                )
+                return RegisterEngineDrivenContextResponse(
+                    shm_name=shm_name, pool_size=pool_size
+                )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
         # other. REGISTER is SYNC-serialized, so it is the sole inserter.
@@ -335,7 +360,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        if isinstance(strategy, ShmTransferStrategy):
+            from lmcache.v1.multiprocess.shm_sequenced_store import SequencedShmStore
+            strategy.sequence_store = SequencedShmStore(strategy,self._shm_records.limit)
         with self._lock:
+            previous_strategy = self._strategies.get(payload.instance_id)
+            if hasattr(previous_strategy, "retire_owned_writes"):
+                previous_strategy.retire_owned_writes()
+            entry.transfer_strategy = strategy
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc
+            )
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
 
@@ -346,9 +381,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.world_size,
         )
 
-        self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
-        )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )
@@ -362,7 +394,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             entry = self._engine_driven_contexts.pop(instance_id, None)
             if entry is not None:
-                self._strategies.pop(instance_id, None)
+                strategy = self._strategies.pop(instance_id, None)
+                if hasattr(strategy, "retire_owned_writes"):
+                    strategy.retire_owned_writes()
         if entry is None:
             logger.warning(
                 "No registered non-GPU context found for instance ID %d",
@@ -372,6 +406,51 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         self._release_entry(instance_id, entry)
         logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
+
+    def _validate_request_limits(self, key):
+        limits = self._ctx.session_manager.request_limits
+        if limits is not None:
+            limits.validate_key(key)
+            # Engine-driven transfer currently resolves a single object group.
+            limits.validate_expansion(key, self._ctx.chunk_size, 1)
+
+    def _sequenced_store(self, instance_id):
+        entry,strategy=self._resolve_for_transfer(instance_id)
+        if not isinstance(strategy,ShmTransferStrategy):
+            raise ValueError('sequenced SHM requires a shared-memory registration')
+        return entry,strategy.sequence_store
+
+    def shm_v2_handshake(self,instance_id: int) -> ShmRegistrationIdentity:
+        _,store=self._sequenced_store(instance_id)
+        return store.handshake()
+
+    def shm_v2_prepare_store(self,key: IPCCacheServerKey,instance_id: int,ref: ShmTransferRef) -> PrepareStoreResponse:
+        self._validate_request_limits(key)
+        entry,store=self._sequenced_store(instance_id)
+        return store.prepare(key,instance_id,ref,entry.metadata,self._resolve_single_group_obj_keys)
+
+    def shm_v2_commit_store(self,instance_id: int,ref: ShmTransferRef) -> bool:
+        _,store=self._sequenced_store(instance_id)
+        return store.commit(instance_id,ref)
+
+    def shm_v2_prepare_retrieve(self,key: IPCCacheServerKey,instance_id: int,ref: ShmTransferRef) -> PrepareRetrieveResponse:
+        self._validate_request_limits(key)
+        _,store=self._sequenced_store(instance_id)
+        return store.prepare_read(key,instance_id,ref,
+            lambda:self.prepare_retrieve(key,instance_id),
+            lambda:self.commit_retrieve(key,instance_id))
+
+    def shm_v2_commit_retrieve(self,instance_id: int,ref: ShmTransferRef) -> bool:
+        _,store=self._sequenced_store(instance_id)
+        return store.commit(instance_id,ref,kind='retrieve')
+
+    def shm_v2_abort_store(self,instance_id: int,ref: ShmTransferRef) -> bool:
+        _,store=self._sequenced_store(instance_id)
+        return store.abort_store(instance_id,ref)
+
+    def shm_v2_ack(self,instance_id: int,ref: ShmTransferRef) -> int:
+        _,store=self._sequenced_store(instance_id)
+        return store.acknowledge(instance_id,ref)
 
     @_lmcache_nvtx_annotate
     def prepare_store(
@@ -388,6 +467,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             PrepareStoreResponse with empty slots for pickle mode.
         """
+        self._validate_request_limits(key)
         entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_store(
             key=key,
@@ -420,6 +500,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
+        self._validate_request_limits(key)
         entry, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("store_start_time", None)
@@ -441,6 +522,22 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         return result
 
+    def _replay_engine_retrieve(self, key, instance_id, result):
+        response = result.result()
+        if response.success and response.context.get("slots"):
+            # Session replay retains the PREPARE result for COMMIT idempotency.
+            # A cached descriptor is exportable only while its exact owned
+            # receipt still protects the SHM range. Completed reads must miss.
+            transfer_key = ShmTransferStrategy._owned_transfer_key(key, instance_id)
+            with self._pending_shm_lock:
+                pending = self._pending_shm_reads.get(transfer_key)
+                if (not isinstance(pending, OwnedShmRead)
+                        or pending.response is not response
+                        or pending.commit_started.is_set()
+                        or pending.completion.done()):
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+        return response
+
     @_lmcache_nvtx_annotate
     def prepare_retrieve(
         self,
@@ -460,6 +557,51 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
+        self._validate_request_limits(key)
+        if key.lookup_id:
+            session = self._ctx.session_manager.get_for_replay(key.request_id, key.lookup_id)
+            if session is None:
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            signature = ("engine-driven", key.model_name, key.world_size,
+                         key.token_ids, key.cache_salt, key.num_kv_readers)
+            previous = session.find_retrieve(key, instance_id, signature)
+            if previous is not None:
+                return self._replay_engine_retrieve(key, instance_id, previous)
+            state = session.prepare_failed_retrieve_release(key)
+            if state is None:
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            obj_keys = self._resolve_single_group_obj_keys(key)
+            try:
+                leases = session.read_lease_snapshot(obj_keys)
+            except KeyError:
+                # A completed lookup can retain only a prefix (or no keys).
+                # Never fall back to an unowned read beyond that coverage.
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            if leases is not None:
+                _, strategy = self._resolve_for_transfer(instance_id)
+                owner, result = session.begin_retrieve(key, instance_id, signature)
+                if not owner:
+                    return self._replay_engine_retrieve(key, instance_id, result)
+                try:
+                    if not session.claim_worker_read(key, instance_id, state[3], obj_keys):
+                        response = PrepareRetrieveResponse(success=False, data=b"", context={})
+                    else:
+                        response = strategy.prepare_retrieve(
+                            key=key, instance_id=instance_id,
+                            resolve_obj_keys=lambda _: obj_keys,
+                            leases=leases, claim_id=f"worker:{instance_id}",
+                        )
+                    if response.success and isinstance(strategy, ShmTransferStrategy):
+                        transfer_key = strategy._owned_transfer_key(key, instance_id)
+                        with self._pending_shm_lock:
+                            pending = self._pending_shm_reads.get(transfer_key)
+                        if pending is not None:
+                            session.retain_external_completion(pending.completion)
+                    result.set_result(response)
+                    return response
+                except BaseException as exc:
+                    result.set_exception(exc)
+                    raise
         _, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
@@ -485,6 +627,32 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Always ``True``.
         """
+        self._validate_request_limits(key)
+        if key.lookup_id:
+            transfer_key = ShmTransferStrategy._owned_transfer_key(key, instance_id)
+            with self._pending_shm_lock:
+                pending = self._pending_shm_reads.get(transfer_key)
+            if isinstance(pending, OwnedShmRead):
+                # Context removal is not completion; an exact COMMIT can still
+                # release its reservation after the instance registry was reaped.
+                finish_owned_shm_read(self._ctx.storage_manager, pending)
+                with self._pending_shm_lock:
+                    if self._pending_shm_reads.get(transfer_key) is pending:
+                        del self._pending_shm_reads[transfer_key]
+                return True
+            session = self._ctx.session_manager.get_for_replay(key.request_id, key.lookup_id)
+            if session is None:
+                return False
+            if session.read_lease_snapshot([]) is not None:
+                # Pickle finished synchronously, or this COMMIT was already
+                # processed. Do not fall through to anonymous SHM reservations.
+                signature = ("engine-driven", key.model_name, key.world_size,
+                             key.token_ids, key.cache_salt, key.num_kv_readers)
+                completed = session.find_retrieve(key, instance_id, signature)
+                return bool(completed is not None and completed.done()
+                            and not completed.cancelled()
+                            and completed.exception() is None
+                            and completed.result().success)
         _, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("retrieve_start_time", None)
