@@ -28,7 +28,10 @@ def prepare(vllm_repo: Path, lmcache_repo: Path, output: Path, base_image: str) 
         destination.mkdir(parents=True)
         data = git(repo, 'archive', '--format=tar', revisions[name], name)
         with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-            archive.extractall(destination, filter='data')
+            # Only Python source is replaced; package resources and binaries
+            # remain pinned to the base. Documentation symlinks are irrelevant.
+            members = [member for member in archive if member.isfile() and member.name.endswith('.py')]
+            archive.extractall(destination, members=members, filter='data')
     recipe = 'custom-patches/runtime-image/'
     for filename in ['Dockerfile', 'repack.py', 'verify.py']:
         (output / filename).write_bytes(git(lmcache_repo, 'show', revisions['lmcache'] + ':' + recipe + filename))
