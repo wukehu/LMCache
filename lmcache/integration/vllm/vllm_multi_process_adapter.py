@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import math
@@ -24,6 +24,7 @@ from lmcache.integration.vllm.mp_server_launcher import (
     maybe_start_mp_server_from_url,
     wait_for_mp_server_from_url,
 )
+from lmcache.integration.vllm.pp_topology import KVParallelTopology
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import (
     CacheStoreEvent,
@@ -366,9 +367,31 @@ class ParallelStrategy:
     ``dcp_size`` token shards instead of one replicated copy."""
 
     @property
+    def pp_topology(self) -> KVParallelTopology | None:
+        """Return global PP geometry, or None for the existing PP1 path.
+
+        Raises:
+            ValueError: For unsupported PP+DCP or inconsistent rank geometry.
+        """
+        if self.pp_size == 1:
+            return None
+        if self.dcp_size != 1:
+            raise ValueError("PP shared cache requires DCP=1")
+        topology = KVParallelTopology(
+            self.tp_size, self.pp_size, self.n_servers, self.mla_only
+        )
+        if topology.world_size != self.vllm_world_size:
+            raise ValueError("PP topology does not match the engine world size")
+        topology.validate_rank(self.vllm_worker_id)
+        return topology
+
+    @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
         on the LMCache server storage."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.shard_count
         if self.mla_only:
             # MLA replicates KV across TP; distinct bytes exist only per
             # pipeline stage and per DCP token shard.
@@ -381,6 +404,9 @@ class ParallelStrategy:
         """Index of the piece of a single token chunk's KV cache
         that the current worker is responsible for,
         in ``[0, kv_world_size)``."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.shard_id(self.vllm_worker_id)
         if self.mla_only:
             # Row-major over (pipeline stage, token shard).
             pp_stage = self.vllm_worker_id // self.tp_size
@@ -401,6 +427,9 @@ class ParallelStrategy:
         split never under-reserves (the server takes one read lock per
         declared reader).
         """
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.readers_per_shard
         if not self.mla_only:
             return 1
         return math.ceil(self.kv_tp_size / self.dcp_size)
@@ -408,11 +437,17 @@ class ParallelStrategy:
     @property
     def kv_tp_size(self) -> int:
         """Tensor-parallel size as seen from a single LMCache server."""
+        topology = self.pp_topology
+        if topology is not None:
+            return min(self.tp_size, topology.ranks_per_server)
         return self.tp_size // self.n_servers
 
     @property
     def is_kv_writer(self) -> bool:
         """Whether this rank is responsible for storing KV."""
+        topology = self.pp_topology
+        if topology is not None:
+            return topology.is_writer(self.vllm_worker_id)
         if not self.mla_only:
             return True
         if self.dcp_size > 1:
@@ -473,6 +508,14 @@ def _normalize_adapter_init_args(
     return int(legacy_block_size), strategy, mq_timeout, False
 
 
+def get_server_epoch(features: set[str]) -> str | None:
+    """Read the optional boot identity from the existing capability response."""
+    epochs = [x for x in features if x.startswith("server_epoch_v1:")]
+    if len(epochs) > 1 or any(x == "server_epoch_v1:" for x in epochs):
+        raise ValueError("Invalid MP server epoch advertisement")
+    return epochs[0] if epochs else None
+
+
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
 
@@ -487,6 +530,7 @@ class HeartbeatThread(PeriodicThread):
         health_event: threading.Event,
         interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         instance_id: int | None = None,
+        server_epoch: str | None = None,
     ):
         """
         Args:
@@ -509,8 +553,9 @@ class HeartbeatThread(PeriodicThread):
         self._health_event = health_event
         self._interval = interval
         self._instance_id = instance_id
+        self._server_epoch = server_epoch
 
-        # Optional callback invoked on the unhealthy->healthy edge,
+        # Callback also runs when a successful ping observes a new boot epoch.
         # before the health event is set. See register_recover_callback.
         def noop() -> bool:
             return True
@@ -551,6 +596,18 @@ class HeartbeatThread(PeriodicThread):
             self._req_client, timeout=self._interval, instance_id=self._instance_id
         )
 
+        observed_epoch = self._server_epoch
+        if healthy and self._server_epoch is not None:
+            try:
+                observed_epoch = get_server_epoch(
+                    get_experimental(self._req_client, timeout=self._interval)
+                )
+                if observed_epoch is None:
+                    raise ValueError("MP server stopped advertising its epoch")
+            except Exception:
+                logger.warning("Failed to verify MP server epoch", exc_info=True)
+                healthy = False
+
         if self.stop_requested:
             return ThreadRunSummary(
                 success=True,
@@ -558,18 +615,24 @@ class HeartbeatThread(PeriodicThread):
             )
 
         need_trigger_recover = (
-            healthy and not was_healthy and self._recover_callback is not None
+            healthy
+            and (not was_healthy or observed_epoch != self._server_epoch)
+            and self._recover_callback is not None
         )
 
         # Try to call recover callback
         if need_trigger_recover:
+            self._health_event.clear()
             logger.warning(
                 "LMCache server is healthy again, triggering recovery callback"
             )
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
 
+        if self.stop_requested:
+            return ThreadRunSummary(success=True, message="stopped during recovery")
         if healthy:
+            self._server_epoch = observed_epoch
             self._health_event.set()
             if not was_healthy:
                 logger.warning(
@@ -729,6 +792,11 @@ class LMCacheMPSchedulerAdapter:
                 chunk_sizes[url] = get_lmcache_chunk_size(
                     client, timeout=self._mq_timeout
                 )
+                if parallel_strategy.pp_size > 1:
+                    if "pp_shared_v1" not in get_experimental(client, timeout=self._mq_timeout):
+                        for peer in self.req_clients.values():
+                            peer.close()
+                        raise ValueError(f"MPServer {url} does not advertise pp_shared_v1")
             except TimeoutError:
                 for c in self.req_clients.values():
                     c.close()
@@ -865,7 +933,9 @@ class LMCacheMPSchedulerAdapter:
         ).no_worker_id_version()
 
         futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+            url: self.req_clients[url].lookup(
+                self._server_lookup_key(key, url), self.tp_size
+            )
             for url in self._server_urls
         }
 
@@ -914,7 +984,9 @@ class LMCacheMPSchedulerAdapter:
                     cache_salt=cs or "",
                     request_configs=request_configs,
                 ).no_worker_id_version()
-                self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
+                self.req_clients[url].free_lookup_locks(
+                    self._server_lookup_key(tail_key, url), self.tp_size
+                )
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -1142,7 +1214,9 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
         for url in self._server_urls:
-            self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
+            self.req_clients[url].free_lookup_locks(
+                self._server_lookup_key(base_key, url), self.tp_size
+            )
 
     def end_session(self, request_id: str) -> None:
         """
@@ -1205,6 +1279,16 @@ class LMCacheMPSchedulerAdapter:
             )
 
     # Helper functions
+    def _server_lookup_key(
+        self, key: IPCCacheServerKey, url: str
+    ) -> IPCCacheServerKey:
+        """Scope lookup and cleanup identically to the server's global pieces."""
+        topology = self.parallel_strategy.pp_topology
+        if topology is None:
+            return key
+        server_id = self._server_urls.index(url)
+        return replace(key, lookup_worker_ids=topology.server_shards(server_id))
+
     def _create_key(
         self,
         token_ids: list[int],
@@ -1572,7 +1656,8 @@ class LMCacheMPWorkerAdapter:
         # Reused when heartbeat recovery re-registers.
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()
-        )
+        ).copy()
+        self._layout_hints["kv_worker_id"] = self.worker_id
         self._send_register_kv_caches_request(kv_caches)
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
@@ -1644,6 +1729,7 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
                 instance_id=self.instance_id,
+                server_epoch=get_server_epoch(self.experimental),
             )
             heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
             heartbeat.start()
@@ -1680,6 +1766,12 @@ class LMCacheMPWorkerAdapter:
             return False
 
         try:
+            # Recovery runs on a fresh heartbeat thread. A device guard may
+            # skip initialization when the ordinal already matches; raw CUDA
+            # IPC export still needs a current context on this thread.
+            device = next(iter(self.kv_caches.values())).device
+            if device.type != "cpu":
+                torch_dev.set_device(device)
             self._send_register_kv_caches_request(self.kv_caches)
         except ConnectionError:
             logger.exception(

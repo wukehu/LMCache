@@ -252,6 +252,9 @@ def fake_adapter(monkeypatch):
     FakeHeartbeatThread.instances.clear()
     FakeHeartbeatThread.start_hook = None
     monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    # This fixture stubs device work as well as IPC; recovery now explicitly
+    # binds the device on its heartbeat thread before rebuilding the context.
+    monkeypatch.setattr(adapter_mod.torch_dev, "set_device", MagicMock())
 
     # KV-cache wrapping pulls in CUDA IPC; bypass for unit tests.
     # First Party

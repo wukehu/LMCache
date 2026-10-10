@@ -4,6 +4,7 @@
 # Standard
 from collections.abc import Sequence
 import threading
+import uuid
 
 # First Party
 from lmcache.logging import init_logger
@@ -54,6 +55,7 @@ class ManagementModule:
         experimental_transfer: Sequence[str] = (),
     ) -> None:
         self._ctx = ctx
+        self._server_epoch = uuid.uuid4().hex
         self._clear_lock = threading.Lock()
         self._liveness_targets = tuple(liveness_targets)
         self._reap_timeout = worker_reap_timeout_seconds
@@ -157,7 +159,9 @@ class ManagementModule:
             The enabled experimental intermediate tensor transfer types.
             See ``lmcache.v1.multiprocess.modules.experimental.__init__``.
         """
-        return list(self._experimental_transfer)
+        return list(self._experimental_transfer) + [
+            "pp_shared_v1", f"server_epoch_v1:{self._server_epoch}"
+        ]
 
     @request_handler(RequestType.CLEAR, HandlerType.BLOCKING)
     def clear(self, force: bool = False) -> None:

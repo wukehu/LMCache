@@ -144,6 +144,8 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        worker_id: The ``kv_worker_id`` layout hint the instance registered
+            with, or ``None`` if it sent none.
     """
 
     cache_context: BaseCacheContext
@@ -152,6 +154,7 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    worker_id: int | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -354,7 +357,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         for entry in entries:
             entry.cache_context.close()
             self._ctx.layout_desc_registry.unregister(
-                entry.model_name, entry.world_size
+                entry.model_name, entry.world_size, worker_id=entry.worker_id
             )
         del entry
         entries.clear()
@@ -423,7 +426,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             engine_type: Which serving engine produced the caches.
                 Forwarded to GPUCacheContext for format detection.
             layout_hints: See LayoutHints.  Forwarded to
-                GPUCacheContext for GPU KV format detection.
+                GPUCacheContext for GPU KV format detection; its
+                ``kv_worker_id`` keys this instance's layouts in the
+                layout registry.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
         """
@@ -468,12 +473,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             for gid in range(num_object_groups)
         }
         attn_desc = kv_groups_manager.get_attn_desc()
+        worker_id = layout_hints.get("kv_worker_id")
         self._ctx.layout_desc_registry.register(
             model_name,
             world_size,
             layout_desc,
             attn_desc,
             group_layout_descs=group_layout_descs,
+            worker_id=worker_id,
         )
 
         with self._lock:
@@ -484,6 +491,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 last_seen=now,
                 has_liveness_signal=False,
                 event_backend=event_backend,
+                worker_id=worker_id,
             )
 
         logger.info(

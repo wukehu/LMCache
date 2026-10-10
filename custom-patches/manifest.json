@@ -1,0 +1,107 @@
+{
+  "upstream": "https://github.com/LMCache/LMCache",
+  "upstream_branch": "dev",
+  "base_commit": "1a4b40b1d79b0e76244f127f96ee0982f8bd270f",
+  "patch_set": "mp-pp-preserved-20261010",
+  "status": "preserved-development-snapshot",
+  "scope": "Independent PP workspace snapshot: namespace, topology, lookup isolation, registration/recovery and tests. Not a merge with the sibling MP-runtime snapshot or a runtime image overlay.",
+  "validation": "Source and Python syntax checked. Test host addresses replaced with RFC 5737 documentation addresses. GPU/runtime tests not rerun; not a release certification.",
+  "files": [
+    {
+      "path": "lmcache/integration/vllm/kubernetes_pp.py",
+      "sha256": "fc9672b3e254e06e1a42885bb7f759a5066fbb682387d3308eae644747b4957c"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_connector.py",
+      "sha256": "b1be491ccb1d45013bcfdb5a77302146a6d822b62dc50ece20b89cbbbed19182"
+    },
+    {
+      "path": "lmcache/integration/vllm/pp_namespace.py",
+      "sha256": "26830eecec5ca8665bbcecb79d5552d7b20b9820c0c93ffb45855f4609d56175"
+    },
+    {
+      "path": "lmcache/integration/vllm/pp_topology.py",
+      "sha256": "9707cbb59fbd9ee6accb04c457932fac4f993c4b50fc0e4c01881a956558e6c2"
+    },
+    {
+      "path": "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+      "sha256": "8246b94e534d38cb9c5d92c530bf87ce9a852afb536c97c0fa70db79e1125acf"
+    },
+    {
+      "path": "lmcache/v1/distributed/api.py",
+      "sha256": "82aede85141597c15db61f92f729d1f99f34c8006955010baa5c8055931a43a2"
+    },
+    {
+      "path": "lmcache/v1/distributed/storage_controllers/prefetch_controller.py",
+      "sha256": "6db6dd6b38a639377a2dea55335444200511af49f4643c7476e0c7421a2fa37a"
+    },
+    {
+      "path": "lmcache/v1/gpu_connector/kv_format/types.py",
+      "sha256": "6d9b8f8d9a9b136a418858fc3248b8aabd8b90c886c6f5cbaccb09646e16c939"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/custom_types.py",
+      "sha256": "5cbae3e561f447676f7db5eb676c7bd7dbb50d0def2527d09462cb433e012620"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/engine_context.py",
+      "sha256": "afcd78d93a13211f5b761d59a0282682ed3bfc7759e93e92795b8fc756ddf22c"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py",
+      "sha256": "64b100654aa6b113425389e42a522742d38d36eec34f8ffbebd74df364724890"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lookup.py",
+      "sha256": "87c7ace42ecec4c013eeb80da189e11aab1c0cbf2fe48e50b5d29a859b7d608f"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/management.py",
+      "sha256": "9a8a3460ae81035d72316f92c1cf000284a42f8dbc83ccb4f8009038f707003d"
+    },
+    {
+      "path": "tests/v1/test_pp_fs_reload.py",
+      "sha256": "2a40d64019877f17f1ac7e0693658b55d650c6eecab2b96403bfad8277e6f779"
+    },
+    {
+      "path": "tests/v1/test_pp_layout_registry.py",
+      "sha256": "77fb48da4c9789648989f58e8658f96f396f39ab7e96bfb7cc1a91992f7981f2"
+    },
+    {
+      "path": "tests/v1/test_pp_lookup_integration.py",
+      "sha256": "0f11fdcafa53d95c095f7b8b820875e2c9b63d0b8668c5085e9ba6bbd8f10f1c"
+    },
+    {
+      "path": "tests/v1/test_pp_lookup_scope.py",
+      "sha256": "527bec287988582fc789f7e796f4390656577641c7814d47766ef8b3428dc876"
+    },
+    {
+      "path": "tests/v1/test_pp_namespace.py",
+      "sha256": "456405338f43afd03240930f73c1d695e13f70a502f26871b0e63173abbd8839"
+    },
+    {
+      "path": "tests/v1/test_pp_node_endpoints.py",
+      "sha256": "058c8650a23ff5d8e1196daf37f9d8d5b083d4bd99d42bd58cd076318664608f"
+    },
+    {
+      "path": "tests/v1/test_pp_parallel_strategy.py",
+      "sha256": "833c8aab8f1ecf57bd792d85155ccc4cd121d8d8723d7ef2651bd24777c13b57"
+    },
+    {
+      "path": "tests/v1/test_pp_recovery_context.py",
+      "sha256": "72331fd97007d2c10d402b90398f3f112dc2a2fd3ec6547cee4d62c3c62c6732"
+    },
+    {
+      "path": "tests/v1/test_pp_recovery_epoch.py",
+      "sha256": "ed9ca5067abe54fc5c1b9a0bf15266ec138f09a6b6b424d69a76225b9cda4f36"
+    },
+    {
+      "path": "tests/v1/test_pp_topology.py",
+      "sha256": "ffc30dd1cf3567debe69857fb7aebf32b3bb361bd9b75ea850369ca8d89d519e"
+    },
+    {
+      "path": "tests/v1/test_vllm_mp_adapter.py",
+      "sha256": "396e31dab0baf95560f731adc81e2f6e079145608da2060a0571e7508763c564"
+    }
+  ]
+}

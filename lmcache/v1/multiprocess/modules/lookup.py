@@ -2,7 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 import threading
 import time
@@ -175,12 +175,22 @@ class LookupModule:
             )
         )
 
+        worker_layouts = self._ctx.layout_desc_registry.find_worker_group_layout_descs(
+            model_name, world_size
+        )
+        missing_workers = (
+            set(key.lookup_worker_ids) - worker_layouts.keys()
+            if key.lookup_worker_ids is not None
+            else set()
+        )
         layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
-        if layout_desc is None:
+        if layout_desc is None or missing_workers:
             logger.error(
-                "No GPU context found for model %s with world size %d during lookup!",
+                "Incomplete KV layout registration for model %s, world size %d, "
+                "missing PP workers=%s",
                 model_name,
                 world_size,
+                sorted(missing_workers),
             )
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -197,7 +207,7 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
-                    early_exit_reason="no_gpu_context",
+                    early_exit_reason=("missing_pp_layout" if missing_workers else "no_gpu_context"),
                 )
             )
             return
@@ -260,6 +270,7 @@ class LookupModule:
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
+        attn_desc = replace(attn_desc, world_size=key.lookup_world_size)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
@@ -295,10 +306,19 @@ class LookupModule:
             )
             return
 
+        ranked_layouts = {
+            ObjectKey.ComputeKVRank(world_size, worker, world_size, worker): layouts
+            for worker, layouts in worker_layouts.items()
+        }
+        object_layouts = {
+            obj: ranked_layouts.get(obj.kv_rank, group_layout_descs)[obj.object_group_id]
+            for obj in obj_keys
+        }
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=obj_keys,
                 group_layout_descs=group_layout_descs,
+                object_layout_descs=object_layouts,
                 num_kv_readers=num_kv_readers,
                 attn_desc=attn_desc,
             ),
@@ -307,7 +327,7 @@ class LookupModule:
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
-                world_size=key.world_size,
+                world_size=key.lookup_world_size,
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
                 num_object_groups=attn_desc.num_object_groups,

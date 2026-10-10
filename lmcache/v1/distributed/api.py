@@ -440,6 +440,14 @@ class PrefetchRequestSpec:
     policy: TrimPolicy = TrimPolicy.PREFIX
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     mode: PrefetchMode = PrefetchMode.LOOKUP
+    object_layout_descs: dict[ObjectKey, MemoryLayoutDesc] | None = None
+    """Exact per-object layouts for heterogeneous PP shards, when provided."""
+
+    def layout_for_key(self, key: ObjectKey) -> MemoryLayoutDesc:
+        """Resolve a key's allocation layout; explicit maps must be complete."""
+        if self.object_layout_descs is not None:
+            return self.object_layout_descs[key]
+        return self.group_layout_descs[key.object_group_id]
 
     def __post_init__(self) -> None:
         if self.num_kv_readers < 1:
@@ -447,6 +455,9 @@ class PrefetchRequestSpec:
                 f"PrefetchRequestSpec: num_kv_readers={self.num_kv_readers} "
                 "must be >= 1 (total read locks per key)"
             )
+        if self.object_layout_descs is not None:
+            if not set(self.keys) <= self.object_layout_descs.keys():
+                raise ValueError("Explicit object layouts must cover all prefetch keys")
         # A caller prefetching a SUBSET of the groups narrows attn_desc, so
         # extra layout entries are harmless; too FEW is the real mistake.
         expected = set(range(self.attn_desc.num_object_groups))
@@ -500,7 +511,7 @@ def ipc_key_to_object_keys(
     lists of ObjectKey.
 
     When the ipc_key's worker_id is None, each chunk hash is exploded into
-    multiple ObjectKeys (one per worker in world_size).
+    multiple ObjectKeys (one per selected worker, or all workers if unscoped).
 
     ``cache_salt`` is read directly from ``ipc_key`` so the produced
     ObjectKeys are per-user isolated whenever the sender set a non-empty
@@ -533,7 +544,11 @@ def ipc_key_to_object_keys(
                 local_world_size=ipc_key.world_size,
                 local_rank=worker_id,
             )
-            for worker_id in range(ipc_key.world_size)
+            for worker_id in (
+                ipc_key.lookup_worker_ids
+                if ipc_key.lookup_worker_ids is not None
+                else range(ipc_key.world_size)
+            )
         ]
     else:
         kv_ranks = [

@@ -234,6 +234,8 @@ class InFlightPrefetchRequest:
     # Key indices found (and read-locked) in L1 when the request starts.
     l1_readlocks: Bitmap = field(default_factory=lambda: Bitmap(0))
 
+    object_layout_descs: dict[ObjectKey, MemoryLayoutDesc] | None = None
+
     group_layout_descs: dict[int, MemoryLayoutDesc] = field(default_factory=dict)
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
     describes a single group's MemoryObj). Covers every object group."""
@@ -893,6 +895,7 @@ class PrefetchController(StorageControllerInterface):
             attn_desc=spec.attn_desc,
             mode=spec.mode,
             group_layout_descs=spec.group_layout_descs,
+            object_layout_descs=spec.object_layout_descs,
             l1_readlocks=l1_readlocks,
         )
 
@@ -1070,10 +1073,17 @@ class PrefetchController(StorageControllerInterface):
         # Batch reserve_write by object_group_id so each group uses its own
         # tensor shapes.
         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
-        by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
-        for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
+        # A PP stage can have a different layer count within the same group.
+        by_group = sorted(keys_to_reserve, key=attrgetter("kv_rank", "object_group_id"))
+        for (_, gid), group_iter in groupby(
+            by_group, key=attrgetter("kv_rank", "object_group_id")
+        ):
             group_keys = list(group_iter)
-            gld = request.group_layout_descs[gid]
+            gld = (
+                request.object_layout_descs[group_keys[0]]
+                if request.object_layout_descs is not None
+                else request.group_layout_descs[gid]
+            )
             gr = self._l1_manager.reserve_write(
                 keys=group_keys,
                 is_temporary=[not retention_map[k] for k in group_keys],

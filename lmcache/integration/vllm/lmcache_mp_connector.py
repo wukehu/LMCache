@@ -4,6 +4,8 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+import json
+import os
 import sys
 import time
 
@@ -54,6 +56,7 @@ from lmcache.integration.vllm.kv_cache_groups import (
     is_scratch_spec,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
+from lmcache.integration.vllm.pp_namespace import pp_cache_namespace
 from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPConnectorMetadata,
     LMCacheMPRequestMetadata,
@@ -590,6 +593,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         server_urls_cfg = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.server_urls", None
         )
+        node_service = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.kubernetes_service", None
+        )
+        if node_service:
+            if server_urls_cfg:
+                raise ValueError("Specify Kubernetes MP discovery or server_urls, not both")
+            from lmcache.integration.vllm.kubernetes_pp import discover_pp_endpoints
+
+            server_urls_cfg = discover_pp_endpoints(
+                node_service, vllm_config.parallel_config.nnodes,
+                node_endpoints=json.loads(os.environ["LMCACHE_MP_NODE_ENDPOINTS"]),
+            )
         if server_urls_cfg:
             if isinstance(server_urls_cfg, list):
                 server_urls = [u.strip() for u in server_urls_cfg if u.strip()]
@@ -649,24 +664,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "supported in a follow-up PR."
             )
 
-        # Multi-server + MLA: only TP is supported (no PP).
-        # PP splits layers across nodes, which would cause per-piece
-        # reader counts to vary per (server, pp_stage) pair and break
-        # the single-``tp_size`` LOOKUP / FREE_LOOKUP_LOCKS protocol.
-        # Non-MLA mode is not affected by this restriction.
-        if n_servers > 1:
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            if pp_size > 1:
-                raise ValueError(
-                    "LMCacheMPConnector multi-server mode only supports "
-                    "tensor parallelism (TP), not pipeline parallelism (PP). "
-                    f"Got pp_size={pp_size}."
-                )
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.pp_shared", False
+            )
+            if enabled is not True:
+                raise ValueError("PP requires the paired pp_shared_v1 client/server and lmcache.mp.pp_shared=true")
+            if dp_size != 1 or getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) != 1:
+                raise ValueError("PP shared cache currently requires DP=PCP=1")
+            if any(not url.startswith("tcp://") for url in server_urls):
+                raise ValueError("PP scoped lookup currently requires ZMQ TCP endpoints")
+            mc = vllm_config.model_config
+            pc = vllm_config.parallel_config
+            cache_model_name = pp_cache_namespace(cache_model_name, {
+                "model_config": mc.hf_config.to_dict(),
+                "revision": getattr(mc, "revision", None),
+                "dtype": str(mc.dtype),
+                "cache_dtype": str(vllm_config.cache_config.cache_dtype),
+                "tp": pc.tensor_parallel_size,
+                "pp": pp_size,
+                "layer_partition": os.environ.get("VLLM_PP_LAYER_PARTITION", ""),
+                "block_size": scheduler_block_size,
+            })
 
         zmq_context = zmq.Context.instance()
         parallel_strategy = build_parallel_strategy_from_vllm_config(
             vllm_config, n_servers
         )
+        if pp_size > 1:
+            _ = parallel_strategy.pp_topology
 
         self.dispatcher = None
 
