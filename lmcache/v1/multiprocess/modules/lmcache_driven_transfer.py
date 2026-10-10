@@ -614,12 +614,15 @@ def transfer_kv_per_object_group(
             group_lmcache_chunk_size = cache_context.get_slots_per_chunk_in_sw(
                 kernel_group_id
             )
+            from lmcache.v1.multiprocess.transfer_context.base import (
+                _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR,
+            )
             tmp_gpu_buffers_batched = [
-                cache_context.get_temp_kernel_group_buffer(
-                    i, kernel_group_id
-                ).data_ptr()
+                cache_context.get_temp_kernel_group_buffer(i, kernel_group_id)
                 for i in range(batch_len)
             ]
+            if not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+                tmp_gpu_buffers_batched = [t.data_ptr() for t in tmp_gpu_buffers_batched]
             device_ops.multi_layer_block_kv_transfer(
                 group_kv_pointers,
                 tmp_gpu_buffers_batched,

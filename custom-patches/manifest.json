@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/LMCache/LMCache",
+  "upstream_branch": "dev",
+  "base_commit": "05a013b29da78cf2321b9b46ec5039dde2fb0bb0",
+  "patch": "Partial-prefix fallback tensor/pointer compatibility with cuda_ops",
+  "validation": "Preserved image patch; source guard and Python syntax checked. GPU tests not rerun.",
+  "files": [
+    {
+      "path": "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py",
+      "sha256": "f12e2a3d1fecdcb20381e0f979da2beec14f59cb855f504b584b4f53e9eefad9"
+    }
+  ]
+}
