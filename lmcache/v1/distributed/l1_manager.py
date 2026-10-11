@@ -4,9 +4,10 @@ Managing objects and memory for L1 cache
 """
 
 # Standard
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Hashable, Literal
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import TTLLock
@@ -23,6 +24,7 @@ from lmcache.v1.distributed.memory_manager import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.read_lease import ReadClaim, ReadLeaseLedger
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -50,6 +52,15 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    committed: bool = False
+    """True only after a successful write completion, never merely write TTL expiry."""
+
+    read_leases: ReadLeaseLedger = field(default_factory=ReadLeaseLedger)
+
+    def has_readers(self) -> bool:
+        """Include completion-scoped copy pins in all eviction/write checks."""
+        return self.read_lock.is_locked() or self.read_leases.is_pinned(time.monotonic())
+
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
 
@@ -68,7 +79,7 @@ class L1ObjectState:
 
         return (
             not self.write_lock.is_locked()
-            and not self.read_lock.is_locked()
+            and not self.has_readers()
             and not self.is_temporary
         )
 
@@ -86,6 +97,15 @@ def l1_mgr_synchronized(func):
 
 
 L1OperationResult = tuple[L1Error, MemoryObj | None]
+
+
+@dataclass(frozen=True)
+class OwnedRead:
+    """Completion receipt retaining the original allocation and exact reader pin."""
+
+    key: ObjectKey
+    entry: L1ObjectState
+    claim: ReadClaim
 
 # Upper bound for the count parameter in reserve_read / finish_read
 # to prevent a single call from holding the global lock for too long.
@@ -299,6 +319,129 @@ class L1Manager:
         return ret
 
     @l1_mgr_synchronized
+    def reserve_owned_read(
+        self, keys: list[ObjectKey], owner: Hashable, read_locks: int
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Reserve committed resident objects for one unique lookup generation.
+
+        Unlike anonymous native reservations, these slots cannot be released by
+        a callback belonging to another lookup. Counts are local to this MP and
+        object group and are never reconstructed from global TP size.
+        """
+        if not 1 <= read_locks <= MAX_READ_LOCK_COUNT:
+            raise ValueError("invalid owned reader count")
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate keys in owned reservation")
+        result: dict[ObjectKey, L1OperationResult] = {}
+        deadline = time.monotonic() + self._read_ttl_seconds
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                result[key] = (L1Error.KEY_NOT_EXIST, None)
+            elif not entry.committed or not entry.available_for_read():
+                result[key] = (L1Error.KEY_NOT_READABLE, None)
+            else:
+                try:
+                    entry.read_leases.reserve(owner, read_locks, deadline)
+                except ValueError:
+                    # A duplicate lookup generation must not acquire another
+                    # reader share or replace the existing reservation.
+                    result[key] = (L1Error.KEY_NOT_READABLE, None)
+                    continue
+                result[key] = (L1Error.SUCCESS, entry.memory_obj)
+        successful = [k for k, (err, _) in result.items() if err == L1Error.SUCCESS]
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_reserved_read(successful)
+        self._event_bus.publish(
+            Event(event_type=EventType.L1_READ_RESERVED, metadata={"keys": successful})
+        )
+        return result
+
+    @l1_mgr_synchronized
+    def acquire_owned_read(
+        self, keys: list[ObjectKey], owner: Hashable, reader: Hashable
+    ) -> dict[ObjectKey, OwnedRead] | None:
+        """Atomically pin a complete batch, including expired resident reservations.
+
+        Missing, replaced, unfinished and foreign objects fail closed. Nothing
+        is enqueued on the GPU here. On partial failure, undo only newly acquired
+        pins; the caller must cancel the remaining reservation for this reader.
+        """
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate keys in owned read batch")
+        acquired: dict[ObjectKey, OwnedRead] = {}
+        expired_by = []
+        for key in keys:
+            entry = self._objects.get(key)
+            claim = None
+            if entry is not None and entry.committed and entry.available_for_read():
+                age = entry.read_leases.expired_by(owner, time.monotonic())
+                claim = entry.read_leases.acquire(owner, reader)
+                if claim is not None and age is not None and age > 0:
+                    expired_by.append(age)
+            if claim is None:
+                for receipt in acquired.values():
+                    receipt.entry.read_leases.complete(receipt.claim)
+                return None
+            acquired[key] = OwnedRead(key, entry, claim)
+        if expired_by:
+            logger.info(
+                "Owned read recovered owner=%s reader=%s keys=%d expired_keys=%d "
+                "min_expired_seconds=%.6f max_expired_seconds=%.6f",
+                owner, reader, len(keys), len(expired_by), min(expired_by), max(expired_by),
+            )
+        return acquired
+
+    @l1_mgr_synchronized
+    def finish_owned_read(self, receipts: list[OwnedRead]) -> None:
+        """Complete exact receipts only after GPU copies have actually finished."""
+        completed: list[ObjectKey] = []
+        freed_keys: list[ObjectKey] = []
+        freed_objects: list[MemoryObj] = []
+        for receipt in receipts:
+            entry = receipt.entry
+            if not entry.read_leases.complete(receipt.claim):
+                continue
+            if self._objects.get(receipt.key) is not entry:
+                continue
+            completed.append(receipt.key)
+            if entry.is_temporary and not entry.has_readers():
+                del self._objects[receipt.key]
+                freed_keys.append(receipt.key)
+                freed_objects.append(entry.memory_obj)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_read_finished(completed)
+        self._event_bus.publish(
+            Event(event_type=EventType.L1_READ_FINISHED, metadata={"keys": completed})
+        )
+        self._free_and_report_deleted(freed_keys, freed_objects)
+
+    @l1_mgr_synchronized
+    def abandon_owned_read(
+        self, keys: list[ObjectKey], owner: str, reader: int
+    ) -> None:
+        """Retire one failed worker's unused share without touching active copies."""
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is not None:
+                entry.read_leases.abandon(owner, reader)
+
+    @l1_mgr_synchronized
+    def cancel_owned_read(self, keys: list[ObjectKey], owner: Hashable) -> None:
+        """Cancel unused slots without releasing already queued copies."""
+        freed_keys: list[ObjectKey] = []
+        freed_objects: list[MemoryObj] = []
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is not None and entry.read_leases.cancel(owner):
+                entry.read_leases.forget(owner)
+                if entry.is_temporary and not entry.has_readers():
+                    del self._objects[key]
+                    freed_keys.append(key)
+                    freed_objects.append(entry.memory_obj)
+        self._free_and_report_deleted(freed_keys, freed_objects)
+
+    @l1_mgr_synchronized
     def unsafe_read(
         self,
         keys: list[ObjectKey],
@@ -406,7 +549,7 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if entry.is_temporary and not entry.has_readers():
                 # NOTE: temporary objects shouldn't have write-locks
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
@@ -483,6 +626,8 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                 continue
 
+            entry.committed = False
+            entry.read_leases = ReadLeaseLedger()
             entry.write_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
@@ -533,6 +678,25 @@ class L1Manager:
         )
         return ret
 
+    def _free_and_report_deleted(
+        self,
+        keys: list[ObjectKey],
+        objs: list[MemoryObj],
+    ) -> None:
+        """Free ``objs`` and report ``keys`` as deleted to listeners and
+        the event bus."""
+        freed_meta = [self._object_meta(obj) for obj in objs]
+        self._memory_manager.free(objs)
+
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": keys, "meta": freed_meta},
+            )
+        )
+
     @l1_mgr_synchronized
     def finish_write(
         self,
@@ -574,7 +738,7 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
-            if entry.read_lock.is_locked():
+            if entry.has_readers():
                 logger.warning(
                     "L1Manager: finish write on read-locked key %s, "
                     "potential inconsistent data might be written",
@@ -584,6 +748,7 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.committed = True
             ret[key] = L1Error.SUCCESS
             if not entry.is_temporary:
                 notification_keys.append(key)
@@ -651,7 +816,7 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_IN_WRONG_STATE, None)
                 continue
 
-            if entry.read_lock.is_locked():
+            if entry.has_readers():
                 logger.warning(
                     "L1Manager: finish_write_and_reserve_read on read-locked key %s",
                     key,
@@ -660,6 +825,7 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
+            entry.committed = True
             for _ in range(total):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
@@ -706,7 +872,7 @@ class L1Manager:
                 ret[key] = L1Error.KEY_NOT_EXIST
                 continue
 
-            locked = entry.read_lock.is_locked() or entry.write_lock.is_locked()
+            locked = entry.has_readers() or entry.write_lock.is_locked()
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
@@ -788,7 +954,7 @@ class L1Manager:
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.write_lock.is_locked() or entry.read_lock.is_locked():
+            if entry.write_lock.is_locked() or entry.has_readers():
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -833,7 +999,7 @@ class L1Manager:
         entry = self._objects.get(key, None)
         if entry is None:
             return False
-        return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
+        return not entry.has_readers() and not entry.write_lock.is_locked()
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current memory usage of L1 cache.
@@ -870,7 +1036,7 @@ class L1Manager:
         for entry in self._objects.values():
             if entry.write_lock.is_locked():
                 write_locked += 1
-            if entry.read_lock.is_locked():
+            if entry.has_readers():
                 read_locked += 1
             if entry.is_temporary:
                 temporary += 1
@@ -916,7 +1082,7 @@ class L1Manager:
         for key, entry in self._objects.items():
             if entry.write_lock.is_locked():
                 num_write_locked += 1
-            if entry.read_lock.is_locked():
+            if entry.has_readers():
                 num_read_locked += 1
 
         logger.info(

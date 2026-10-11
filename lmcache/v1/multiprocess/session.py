@@ -6,13 +6,16 @@ in the multiprocess cache server.
 
 # Standard
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional, overload
 import threading
 import time
+import uuid
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import (
@@ -47,6 +50,9 @@ class Session:
     prefetch_group_windows: tuple[int, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
     _lookup_generation: int = field(default=0, repr=False)
+    _owned_read_owner: str | None = field(default=None, repr=False)
+    _owned_read_keys: tuple[ObjectKey, ...] = field(default=(), repr=False)
+    _owned_read_closed: bool = field(default=False, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
         default_factory=set, repr=False
     )
@@ -149,11 +155,75 @@ class Session:
         """Record a new lookup and reset its per-lookup release state."""
         with self._lock:
             self.lookup_ipc_key = key
+            self._owned_read_owner = None
+            self._owned_read_keys = ()
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
             self.prefetch_group_windows = group_windows
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
+
+    def bind_owned_read(self, keys: list[ObjectKey]) -> str:
+        """Bind this lookup to a unique token, including across session recreation.
+
+        The caller must cancel the previous owned_read_state before a new lookup.
+        """
+        with self._lock:
+            if self._owned_read_closed:
+                raise RuntimeError("cannot bind a destroyed lookup session")
+            self._owned_read_owner = uuid.uuid4().hex
+            self._owned_read_keys = tuple(keys)
+            return self._owned_read_owner
+
+    @contextmanager
+    def owned_reservation_scope(self, owner: str | None):
+        """Serialize publication of owned reservations against session destruction."""
+        if owner is None:
+            yield
+            return
+        with self._lock:
+            if self._owned_read_closed or owner != self._owned_read_owner:
+                raise RuntimeError("lookup owner is no longer active")
+            yield
+
+    def cancel_owned_reads(self, cancel, final: bool = False) -> None:
+        """Cancel published reservations atomically with owner invalidation.
+
+        Lock order is session -> L1. The cancellation callback must not reenter
+        this session. Active GPU receipt completion requires only the L1 lock.
+        """
+        with self._lock:
+            if final:
+                self._owned_read_closed = True
+            if self._owned_read_owner is not None:
+                cancel(list(self._owned_read_keys), self._owned_read_owner)
+            self._owned_read_owner = None
+            self._owned_read_keys = ()
+
+    def owned_read_state(self) -> tuple[str, tuple[ObjectKey, ...]] | None:
+        """Return immutable ownership for cancellation without inventing a session."""
+        with self._lock:
+            if self._owned_read_owner is None:
+                return None
+            return self._owned_read_owner, self._owned_read_keys
+
+    def owned_read_for(
+        self, key: IPCCacheServerKey, require_worker: bool = True
+    ) -> str | None:
+        """Validate the worker's lookup scope before allowing resident recovery."""
+        with self._lock:
+            lookup = self.lookup_ipc_key
+            if (
+                lookup is None or (require_worker and key.worker_id is None)
+                or self.prefetch_hit_chunks < 0
+                or key.model_name != lookup.model_name
+                or key.world_size != lookup.world_size
+                or key.token_ids != lookup.token_ids
+                or key.cache_salt != lookup.cache_salt
+                or key.start < lookup.start or key.end > lookup.end
+            ):
+                return None
+            return self._owned_read_owner
 
     def record_prefetch_result(
         self,

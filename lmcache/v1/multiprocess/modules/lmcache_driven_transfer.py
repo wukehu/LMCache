@@ -708,6 +708,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
         )
+        self._device_host_func_dispatcher.register(
+            "finish_owned_read",
+            self._ctx.storage_manager.finish_owned_read,
+            payload_type=str,
+        )
         self._device_host_func_dispatcher.start()
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
@@ -780,6 +785,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             return
         if obj_keys:
+            if session.owned_read_state() is not None:
+                owner = session.owned_read_for(key)
+                if owner is not None:
+                    self._ctx.storage_manager.abandon_owned_read(
+                        obj_keys, owner, instance_id
+                    )
+                return
             # One failed RETRIEVE owns one read lock per key.  In
             # particular, do not release the scheduler's whole MLA
             # reservation here: the remaining TP workers and concurrent
@@ -1441,6 +1453,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 if g not in skipped_groups
             )
 
+            session = self._ctx.session_manager.get(key.request_id)
+            owned_state = session.owned_read_state() if session is not None else None
+            read_owner = session.owned_read_for(key) if owned_state is not None else None
+            if (owned_state is not None or self._ctx.storage_manager.supports_owned_reads()) and read_owner is None:
+                return b"", False
+            owned_handles: list[str] = []
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
@@ -1450,9 +1468,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         continue
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
-                    with self._ctx.storage_manager.read_prefetched_results(
-                        in_window_keys
-                    ) as window_objs:
+                    read_context = (
+                        self._ctx.storage_manager.read_owned_prefetched_results(
+                            in_window_keys, read_owner, instance_id, owned_handles
+                        ) if read_owner is not None else
+                        self._ctx.storage_manager.read_prefetched_results(in_window_keys)
+                    )
+                    with read_context as window_objs:
                         if not window_objs or len(window_objs) != len(in_window_keys):
                             logger.error("Some keys not found during retrieve!")
                             retrieve_succeeded = False
@@ -1486,7 +1508,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 retrieve_succeeded = False
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                if prefetched_keys:
+                if owned_handles:
+                    try:
+                        for handle in owned_handles:
+                            submit_callback_to_stream(
+                                cache_context.cupy_stream, "finish_owned_read", handle
+                            )
+                    except Exception:
+                        # A submission error can follow a partially enqueued
+                        # copy. Keep every source pinned until the stream drains.
+                        cache_context.cupy_stream.synchronize()
+                        for handle in owned_handles:
+                            self._ctx.storage_manager.finish_owned_read(handle)
+                        raise
+                elif prefetched_keys and read_owner is None:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_read_prefetched",

@@ -34,6 +34,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.read_completion import ReadCompletionRegistry
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
@@ -85,6 +86,9 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        self._owned_reads_enabled = os.environ.get("LMCACHE_MP_OWNED_READ_LEASE") == "1"
+        if self._owned_reads_enabled and config.l2_adapter_config.adapters:
+            raise ValueError("owned read leases currently require L1-only storage")
         self._source_mapping = parse_source_mapping(
             os.environ.get("LMCACHE_MP_SOURCE_MAPPING", "{}")
         )
@@ -106,6 +110,14 @@ class StorageManager:
             "l1",
         )
         self._l1_manager = L1Manager(config.l1_manager_config)
+        self._read_completions = ReadCompletionRegistry(
+            self._l1_manager.finish_owned_read
+        )
+        register_gauge(
+            "lmcache.mp_server", "lmcache_mp.owned_read_pending_completions",
+            "Owned read batches waiting for actual GPU completion",
+            self._read_completions.pending_count,
+        )
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
         self._l1_config = config.l1_manager_config
@@ -209,6 +221,55 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+    def supports_owned_reads(self) -> bool:
+        """Owned MP lookup is currently supported only with no L2 adapters."""
+        return self._owned_reads_enabled and not self._has_l2_adapters()
+
+    def cancel_owned_read(self, keys: list[ObjectKey], owner: str) -> None:
+        """Cancel lookup reservations, retaining any GPU copies already in flight."""
+        self._l1_manager.cancel_owned_read(keys, owner)
+
+    def abandon_owned_read(self, keys: list[ObjectKey], owner: str, reader: int) -> None:
+        """Release only one failed worker's unused lookup slots."""
+        self._l1_manager.abandon_owned_read(keys, owner, reader)
+
+    def begin_owned_read(
+        self, keys: list[ObjectKey], owner: str, reader: int
+    ) -> tuple[str, list[MemoryObj]] | None:
+        """Pin a complete batch and return a serializable completion handle."""
+        receipts = self._l1_manager.acquire_owned_read(keys, owner, reader)
+        if receipts is None:
+            return None
+        values = list(receipts.values())
+        try:
+            handle = self._read_completions.register(values)
+        except BaseException:
+            self._l1_manager.finish_owned_read(values)
+            raise
+        return handle, [receipt.entry.memory_obj for receipt in values]
+
+    def finish_owned_read(self, handle: str) -> None:
+        """Complete a GPU callback handle, never a content-key-only release."""
+        self._read_completions.complete(handle)
+
+    @contextmanager
+    def read_owned_prefetched_results(
+        self, keys: list[ObjectKey], owner: str, reader: int,
+        completion_handles: list[str],
+    ) -> Iterator[list[MemoryObj] | None]:
+        """Return pinned objects; caller completes handles after stream completion.
+
+        Append before yielding: an exception inside a copy may follow partial
+        enqueue, so releasing in this context manager's finally is unsafe.
+        """
+        result = self.begin_owned_read(keys, owner, reader)
+        if result is None:
+            yield None
+            return
+        handle, objects = result
+        completion_handles.append(handle)
+        yield objects
+
     @enable_tracing()
     def reserve_write(
         self,
@@ -443,6 +504,7 @@ class StorageManager:
         spec: PrefetchRequestSpec,
         external_request_id: str = "",
         skip_l2: bool = False,
+        read_owner: str | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -468,6 +530,8 @@ class StorageManager:
             ),
         )
         keys = spec.keys
+        if read_owner is not None and not self.supports_owned_reads():
+            raise ValueError("owned lookup requires an L1-only storage manager")
 
         if spec.mode is PrefetchMode.WARM:
             # Warm path: load all keys, lock none. skip_l2 makes it a no-op.
@@ -492,9 +556,14 @@ class StorageManager:
         # NOTE: now we only have L1, so the prefetch is essentially checking how many
         # objects are already in L1, and adding read locks to them.
 
-        l1_read_result = self._l1_manager.reserve_read(
-            keys, read_locks=spec.num_kv_readers
-        )
+        if read_owner is None:
+            l1_read_result = self._l1_manager.reserve_read(
+                keys, read_locks=spec.num_kv_readers
+            )
+        else:
+            l1_read_result = self._l1_manager.reserve_owned_read(
+                keys, read_owner, spec.num_kv_readers
+            )
 
         spec.source_ledger.resident(
             (key, spec.source_ledger.payload_bytes(key.object_group_id))
@@ -558,6 +627,7 @@ class StorageManager:
                 l1_read_result,
                 external_request_id,
                 skip_l2,
+                read_owner,
             )
 
         raise ValueError(f"Unsupported trim policy: {spec.policy}")
@@ -568,6 +638,7 @@ class StorageManager:
         l1_read_result: dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]],
         external_request_id: str,
         skip_l2: bool,
+        read_owner: str | None = None,
     ) -> PrefetchHandle:
         """PREFIX path: fold L1 presence, retain in-window keys, submit rest to L2.
 
@@ -609,7 +680,10 @@ class StorageManager:
         released_bitmap = l1_presence & (~retain)
         released = released_bitmap.gather(keys)
         if released:
-            self._l1_manager.finish_read(released, read_locks=spec.num_kv_readers)
+            if read_owner is None:
+                self._l1_manager.finish_read(released, read_locks=spec.num_kv_readers)
+            else:
+                self._l1_manager.cancel_owned_read(released, read_owner)
 
         # Keys from chunk l1_hit_chunks onwards are candidates for L2.
         l1_key_boundary = l1_hit_chunks * stride
@@ -625,7 +699,7 @@ class StorageManager:
             )
         )
 
-        l1_only = skip_l2 or not self._has_l2_adapters()
+        l1_only = read_owner is not None or skip_l2 or not self._has_l2_adapters()
         prefetch_request_id = -1
         l2_orig_indices: tuple[int, ...] = ()
 
@@ -1075,6 +1149,8 @@ class StorageManager:
         Returns:
             The stable id assigned to the new adapter.
         """
+        if self._owned_reads_enabled:
+            raise ValueError("disable owned read leases before adding an L2 adapter")
         with self._lifecycle_lock:
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             for listener in self._registered_l2_listeners:
