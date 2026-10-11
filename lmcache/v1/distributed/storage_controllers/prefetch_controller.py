@@ -85,6 +85,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.mp_observability.source_attribution import SourceLedger
 from lmcache.v1.platform import (
     consume_fd,
     create_event_notifier,
@@ -237,6 +238,8 @@ class InFlightPrefetchRequest:
     group_layout_descs: dict[int, MemoryLayoutDesc] = field(default_factory=dict)
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
     describes a single group's MemoryObj). Covers every object group."""
+
+    source_ledger: SourceLedger | None = None
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -829,6 +832,7 @@ class PrefetchController(StorageControllerInterface):
         num_kv_readers: int,
         policy: TrimPolicy,
         attn_desc: AttnWindowDesc,
+        source_ledger: SourceLedger | None = None,
     ) -> Bitmap:
         """Read-lock the L1-resident keys the request will hold.
 
@@ -846,12 +850,19 @@ class PrefetchController(StorageControllerInterface):
             num_kv_readers: Read locks per locked key.
             policy: The request's retained-subset policy.
             attn_desc: Per-group cross-chunk attention windows.
+            source_ledger: Optional in-process source recorder for this attempt.
 
         Returns:
             Bitmap of the key indices read-locked in L1, after releasing
             out-of-window sliding-window chunks.
         """
         lock_results = self._l1_manager.reserve_read(keys, read_locks=num_kv_readers)
+        if source_ledger is not None:
+            source_ledger.resident(
+                (key, source_ledger.payload_bytes(key.object_group_id))
+                for key, (err, obj) in lock_results.items()
+                if err == L1Error.SUCCESS and obj is not None
+            )
         l1_readlocks = Bitmap(len(keys))
         for i, key in enumerate(keys):
             err, _obj = lock_results[key]
@@ -882,7 +893,11 @@ class PrefetchController(StorageControllerInterface):
         """Read-lock L1-resident keys, then submit lookup_and_lock to all
         live (non-draining) adapters for a new request."""
         l1_readlocks = self._lock_l1_keys(
-            spec.keys, spec.num_kv_readers, spec.policy, spec.attn_desc
+            spec.keys,
+            spec.num_kv_readers,
+            spec.policy,
+            spec.attn_desc,
+            spec.source_ledger,
         )
         request = InFlightPrefetchRequest(
             request_id=request_id,
@@ -894,6 +909,7 @@ class PrefetchController(StorageControllerInterface):
             mode=spec.mode,
             group_layout_descs=spec.group_layout_descs,
             l1_readlocks=l1_readlocks,
+            source_ledger=spec.source_ledger,
         )
 
         # Skip adapters being drained so a new request never locks keys on
@@ -1318,8 +1334,23 @@ class PrefetchController(StorageControllerInterface):
             if load_bitmap is None:
                 continue
             plan_indices = plan_bitmap.get_indices_list()
-            for global_i in load_bitmap.gather(plan_indices):
+            successful_indices = load_bitmap.gather(plan_indices)
+            for global_i in successful_indices:
                 result_bitmap.set(global_i)
+            if request.source_ledger is not None:
+                request.source_ledger.loaded(
+                    adapter_idx,
+                    self._adapter_descriptors[adapter_idx].type_name,
+                    (
+                        (
+                            request.keys[i],
+                            request.source_ledger.payload_bytes(
+                                request.keys[i].object_group_id
+                            ),
+                        )
+                        for i in successful_indices
+                    ),
+                )
 
         # Separate loaded vs. failed among write-reserved keys
         loaded_keys: list[ObjectKey] = result_bitmap.gather(request.keys)

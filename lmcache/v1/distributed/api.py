@@ -7,7 +7,7 @@ Could be implemented by native code in the future
 """
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, get_args
 import enum
 
@@ -19,6 +19,7 @@ from lmcache.logging import init_logger
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.mp_observability.source_attribution import SourceLedger
     from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 
 logger = init_logger(__name__)
@@ -440,6 +441,10 @@ class PrefetchRequestSpec:
     policy: TrimPolicy = TrimPolicy.PREFIX
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     mode: PrefetchMode = PrefetchMode.LOOKUP
+    source_ledger: "SourceLedger | None" = field(
+        default=None, compare=False, repr=False
+    )
+    """In-process physical attribution only; omitted from IPC/trace codecs."""
 
     def __post_init__(self) -> None:
         if self.num_kv_readers < 1:
@@ -488,6 +493,11 @@ class PrefetchHandle:
     l2_orig_indices: tuple[int, ...] = ()
     """Original-key index of each key submitted to L2; maps the controller's
     local result bitmap back to original positions."""
+
+    source_spec: "PrefetchRequestSpec | None" = field(
+        default=None, compare=False, repr=False
+    )
+    """Original key order/policy and request-local provenance; not serialized."""
 
 
 def ipc_key_to_object_keys(

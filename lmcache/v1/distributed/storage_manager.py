@@ -7,6 +7,7 @@ Distributed multi-tier storage manager for MP mode
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Iterator, Literal, Optional
+import os
 import threading
 import time
 
@@ -50,6 +51,9 @@ from lmcache.v1.distributed.storage_controllers import (
     PrefetchController,
     StoreController,
 )
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    build_trim_mask,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
@@ -62,6 +66,13 @@ from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.mp_observability.source_attribution import (
+    Source,
+    SourceLedger,
+    SourceMetrics,
+    parse_source_mapping,
+    payload_sizes,
+)
 from lmcache.v1.mp_observability.trace.decorator import (
     enable_tracing,
     is_tracing_enabled,
@@ -74,6 +85,26 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        self._source_mapping = parse_source_mapping(
+            os.environ.get("LMCACHE_MP_SOURCE_MAPPING", "{}")
+        )
+        self._source_metrics = SourceMetrics()
+        l1 = config.l1_manager_config
+        backend = (
+            "gds"
+            if l1.gds_l1_config
+            else "devdax"
+            if l1.memory_config.devdax_path
+            else "dram"
+        )
+        self._l1_source = Source(
+            self._source_mapping.get(
+                "l1", "local_cpu" if backend == "dram" else "unknown"
+            ),
+            "l1",
+            backend,
+            "l1",
+        )
         self._l1_manager = L1Manager(config.l1_manager_config)
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
@@ -425,6 +456,17 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
+        # Every submission is a new physical attempt, including retries.
+        spec = replace(
+            spec,
+            source_ledger=SourceLedger(
+                self._source_metrics,
+                self._l1_source,
+                self._source_mapping,
+                spec.mode.name.lower(),
+                payload_sizes(spec.group_layout_descs),
+            ),
+        )
         keys = spec.keys
 
         if spec.mode is PrefetchMode.WARM:
@@ -441,6 +483,7 @@ class StorageManager:
                 l1_hit_chunks=0,
                 total_requested_keys=len(keys),
                 submit_time=time.monotonic(),
+                source_spec=spec,
                 l2_orig_indices=(
                     tuple(range(len(keys))) if prefetch_request_id != -1 else ()
                 ),
@@ -451,6 +494,12 @@ class StorageManager:
 
         l1_read_result = self._l1_manager.reserve_read(
             keys, read_locks=spec.num_kv_readers
+        )
+
+        spec.source_ledger.resident(
+            (key, spec.source_ledger.payload_bytes(key.object_group_id))
+            for key, (err, obj) in l1_read_result.items()
+            if err == L1Error.SUCCESS and obj is not None
         )
 
         if spec.policy is TrimPolicy.SPARSE:
@@ -493,6 +542,7 @@ class StorageManager:
                 l1_hit_chunks=0,
                 total_requested_keys=len(keys),
                 submit_time=time.monotonic(),
+                source_spec=spec,
                 l2_orig_indices=(
                     tuple(sparse_l2_indices) if prefetch_request_id != -1 else ()
                 ),
@@ -607,6 +657,7 @@ class StorageManager:
             l1_hit_chunks=l1_hit_chunks,
             total_requested_keys=len(keys),
             submit_time=submit_time,
+            source_spec=spec,
             l2_orig_indices=l2_orig_indices,
         )
 
@@ -714,6 +765,12 @@ class StorageManager:
                 return None
 
         found = self._combine_found(handle, l2_r)
+        spec = handle.source_spec
+        if spec is not None and spec.source_ledger is not None:
+            _, retained = build_trim_mask(
+                found, len(spec.keys), spec.policy, spec.attn_desc
+            )
+            spec.source_ledger.finish(retained.gather(spec.keys))
         # popcount (not count_leading_ones) so the log is accurate for
         # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
         total_hits = found.popcount()
