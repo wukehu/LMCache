@@ -118,9 +118,15 @@ class LookupModule:
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
+        self._ctx.session_manager.destroy_listeners.append(
+            lambda session: self._cancel_owned_session(session, final=True)
+        )
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
         self._setup_metrics()
+
+    def _cancel_owned_session(self, session, final: bool = False) -> None:
+        session.cancel_owned_reads(self._ctx.storage_manager.cancel_owned_read, final)
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -261,9 +267,16 @@ class LookupModule:
             model_name, world_size
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
+        self._cancel_owned_session(session)
         session.set_tokens(list(key.token_ids))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
+        read_owner = (
+            session.bind_owned_read(obj_keys)
+            if self._ctx.storage_manager.supports_owned_reads() else None
+        )
+        if read_owner is not None:
+            logger.info("Owned lookup request_id=%s owner=%s", key.request_id, read_owner)
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -295,15 +308,17 @@ class LookupModule:
             )
             return
 
-        handle = self._ctx.storage_manager.submit_prefetch_task(
-            PrefetchRequestSpec(
-                keys=obj_keys,
-                group_layout_descs=group_layout_descs,
-                num_kv_readers=num_kv_readers,
-                attn_desc=attn_desc,
-            ),
-            external_request_id=key.request_id,
-        )
+        with session.owned_reservation_scope(read_owner):
+            handle = self._ctx.storage_manager.submit_prefetch_task(
+                PrefetchRequestSpec(
+                    keys=obj_keys,
+                    group_layout_descs=group_layout_descs,
+                    num_kv_readers=num_kv_readers,
+                    attn_desc=attn_desc,
+                ),
+                external_request_id=key.request_id,
+                read_owner=read_owner,
+            )
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
@@ -490,6 +505,21 @@ class LookupModule:
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         if key.start >= key.end:
+            return
+
+        session = self._ctx.session_manager.get(key.request_id)
+        if session is None:
+            return
+        state = session.owned_read_state()
+        if state is not None:
+            owner = session.owned_read_for(key, require_worker=False)
+            if owner is None:
+                return
+            obj_keys = resolve_prefetched_obj_keys(
+                self._ctx, key, session.prefetch_hit_chunks,
+                session.prefetch_locked_gids,
+            )
+            self._ctx.storage_manager.cancel_owned_read(obj_keys, owner)
             return
 
         hit_chunks = self._ctx.session_manager.get_or_create(

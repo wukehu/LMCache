@@ -126,6 +126,8 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
         [f"g{g}c{c}" for c in range(num_chunks)] for g in range(num_object_groups)
     ]
     ctx = MagicMock()
+    ctx.session_manager.get.return_value = None
+    ctx.storage_manager.supports_owned_reads.return_value = False
     ctx.chunk_size = 256
     ctx.resolve_obj_keys.return_value = obj_keys
 
@@ -161,6 +163,53 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
     monkeypatch.setattr(mod, "Event", MagicMock())
 
     return module, read_calls, transfer_calls
+
+
+def test_owned_copy_exception_keeps_receipt_until_stream_callback(monkeypatch):
+    module, _, _ = _make_module(monkeypatch, 1, [-1])
+    session = MagicMock()
+    session.owned_read_state.return_value = ("owner", ())
+    session.owned_read_for.return_value = "owner"
+    module._ctx.session_manager.get.return_value = session
+    @contextmanager
+    def owned_read(keys, owner, reader, handles):
+        handles.append("receipt")
+        yield [MagicMock(get_size=MagicMock(return_value=10))]
+    module._ctx.storage_manager.read_owned_prefetched_results.side_effect = owned_read
+    scheduled = []
+    monkeypatch.setattr(mod, "submit_callback_to_stream", lambda stream, kind, value: scheduled.append((kind, value)))
+    def partial_copy(*args, **kwargs):
+        raise RuntimeError("failed after a possible partial enqueue")
+    monkeypatch.setattr(mod, "transfer_kv_per_object_group", partial_copy)
+    _, ok = module.retrieve(SimpleNamespace(request_id="req", cache_salt="salt"), 1, [[1]], b"x")
+    assert not ok
+    assert scheduled == [("finish_owned_read", "receipt")]
+    module._ctx.storage_manager.finish_owned_read.assert_not_called()
+
+
+def test_callback_submission_failure_drains_stream_before_release(monkeypatch):
+    module, _, _ = _make_module(monkeypatch, 1, [-1])
+    session = MagicMock()
+    session.owned_read_state.return_value = ("owner", ())
+    session.owned_read_for.return_value = "owner"
+    module._ctx.session_manager.get.return_value = session
+    @contextmanager
+    def owned_read(keys, owner, reader, handles):
+        handles.append("receipt")
+        yield [MagicMock(get_size=MagicMock(return_value=10))]
+    module._ctx.storage_manager.read_owned_prefetched_results.side_effect = owned_read
+    order = []
+    context = module.get_and_touch_context_entry(1).cache_context
+    context.cupy_stream.synchronize.side_effect = lambda: order.append("drain")
+    module._ctx.storage_manager.finish_owned_read.side_effect = lambda handle: order.append("release")
+    def fail_callback(*args):
+        raise RuntimeError("callback submission failed")
+    monkeypatch.setattr(mod, "submit_callback_to_stream", fail_callback)
+    try:
+        module.retrieve(SimpleNamespace(request_id="req", cache_salt="salt"), 1, [[1]], b"x")
+    except RuntimeError:
+        pass
+    assert order == ["drain", "release"]
 
 
 def test_retrieve_reads_and_transfers_only_in_window(monkeypatch):
