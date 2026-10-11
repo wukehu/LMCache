@@ -13,10 +13,12 @@ from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 import json
+import logging
 import math
 import threading
 
 SOURCES = frozenset({"local_cpu", "local_disk", "remote_store", "peer", "unknown"})
+logger = logging.getLogger(__name__)
 
 
 def payload_sizes(layouts: Mapping[int, Any]) -> dict[int, int]:
@@ -183,13 +185,15 @@ class SourceLedger:
                     self._objects[key] = obj
                     self._loaded.add(key)
                     new.append(obj)
-            self._metrics.record("loaded", self.mode, new)
+        self._record("loaded", new)
 
     def finish(self, retained: Iterable[Hashable]) -> None:
         """Count final policy-retained objects once; warmups do not claim reuse.
 
         Missing provenance counts as unknown with an explicit missing-size
         counter. An observability gap must not fail the serving request.
+        A failed or partially emitted batch is not retried: counters are not
+        transactional, so retrying could double-count successful additions.
         """
         with self._lock:
             if self._finished:
@@ -198,11 +202,29 @@ class SourceLedger:
                 Source("unknown", "unknown", "unknown", "unknown"), None
             )
             objects = [self._objects.get(key, unknown) for key in set(retained)]
-            if self.mode == "lookup":
-                self._metrics.record("retained", self.mode, objects)
             self._finished = True
+        if self.mode == "lookup":
+            self._record("retained", objects)
 
     def snapshot(self) -> dict[Hashable, SourceObject]:
         """Return a detached source map for request diagnostics (not metric labels)."""
         with self._lock:
             return dict(self._objects)
+
+    def _record(self, stage: str, objects: list[SourceObject]) -> None:
+        # Deduplication is committed before calling external instrumentation,
+        # outside the ledger lock. Metrics must not interrupt storage cleanup.
+        if not objects:
+            return
+        try:
+            self._metrics.record(stage, self.mode, objects)
+        except Exception:
+            try:
+                logger.exception(
+                    "KV source %s metrics failed; batch will not be retried "
+                    "and source counters may be incomplete",
+                    stage,
+                )
+            except Exception:
+                # A failing logging handler must not break cache serving either.
+                pass
