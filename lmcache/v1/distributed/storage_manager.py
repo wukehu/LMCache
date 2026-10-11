@@ -443,6 +443,8 @@ class StorageManager:
         spec: PrefetchRequestSpec,
         external_request_id: str = "",
         skip_l2: bool = False,
+        *,
+        source_is_peer: bool = False,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -452,6 +454,9 @@ class StorageManager:
             skip_l2: If True, do not load from L2. For ``LOOKUP`` only
                 already-resident L1 keys are returned; for ``WARM`` nothing is
                 loaded and an empty handle is returned.
+            source_is_peer: Attribute a peer-serving LOOKUP with metric mode
+                ``peer_lookup`` instead of engine ``lookup``. Observability
+                only; prefetch policy, storage operations and locks are unchanged.
 
         Returns:
             PrefetchHandle to track the task.
@@ -463,7 +468,9 @@ class StorageManager:
                 self._source_metrics,
                 self._l1_source,
                 self._source_mapping,
-                spec.mode.name.lower(),
+                "peer_lookup"
+                if source_is_peer and spec.mode is PrefetchMode.LOOKUP
+                else spec.mode.name.lower(),
                 payload_sizes(spec.group_layout_descs),
             ),
         )

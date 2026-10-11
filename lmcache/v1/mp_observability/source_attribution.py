@@ -170,9 +170,15 @@ class SourceLedger:
     def loaded(
         self, adapter: int, backend: str, objects: Iterable[tuple[Hashable, int]]
     ) -> None:
-        """Record only successful L2 load results, once per object in this attempt."""
+        """Record successful L2 loads once per object in this attempt.
+
+        P2P is always a peer source, independent of dynamic adapter IDs and
+        physical-media mappings. This does not infer the peer's backing medium.
+        """
         source = Source(
-            self._mapping.get(f"l2:{adapter}", "unknown"),
+            "peer"
+            if backend == "p2p"
+            else self._mapping.get(f"l2:{adapter}", "unknown"),
             "l2",
             backend,
             str(adapter),
@@ -192,6 +198,8 @@ class SourceLedger:
 
         Missing provenance counts as unknown with an explicit missing-size
         counter. An observability gap must not fail the serving request.
+        Peer-serving lookups use mode ``peer_lookup`` so engine attribution
+        queries must filter on mode ``lookup`` when aggregating across nodes.
         A failed or partially emitted batch is not retried: counters are not
         transactional, so retrying could double-count successful additions.
         """
@@ -203,7 +211,7 @@ class SourceLedger:
             )
             objects = [self._objects.get(key, unknown) for key in set(retained)]
             self._finished = True
-        if self.mode == "lookup":
+        if self.mode in {"lookup", "peer_lookup"}:
             self._record("retained", objects)
 
     def snapshot(self) -> dict[Hashable, SourceObject]:

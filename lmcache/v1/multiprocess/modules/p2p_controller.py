@@ -230,6 +230,7 @@ class P2PController:
             ),
             external_request_id=f"p2p-{task_id}",
             skip_l2=True,
+            source_is_peer=True,
         )
 
         with self._job_lock:
