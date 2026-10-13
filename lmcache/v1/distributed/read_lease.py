@@ -9,6 +9,7 @@ by a content hash: a replaced allocation may have the same hash.
 # Standard
 from dataclasses import dataclass, field
 from typing import Hashable
+import math
 
 
 @dataclass(frozen=True, eq=False)
@@ -67,6 +68,21 @@ class ReadLeaseLedger:
         reservation.claimed.add(reader)
         self._active[claim] = reservation
         return claim
+
+    def renew(self, owner: Hashable, deadline: float) -> bool:
+        """Extend an existing pending owner without adding or reviving readers.
+
+        The caller authenticates the Session and validates its bounded future
+        deadline. This ledger belongs to one allocation incarnation only.
+        """
+        if not math.isfinite(deadline):
+            raise ValueError("read lease deadline must be finite")
+        reservation = self._owners.get(owner)
+        if (reservation is None or reservation.cancelled
+                or len(reservation.completed) >= reservation.readers):
+            return False
+        reservation.deadline = max(reservation.deadline, deadline)
+        return True
 
     def complete(self, claim: ReadClaim) -> bool:
         """Release exactly this pin; stale, forged or duplicate tokens do nothing."""

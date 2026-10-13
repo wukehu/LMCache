@@ -19,7 +19,8 @@ class ZmqMultiprocessClient(RequestClient):
 
     The wrapper changes only the Python call surface. Every method delegates to
     :class:`MessageQueueClient` with the existing ``RequestType`` and positional
-    payload list, so the ZMQ wire protocol and server remain unchanged.
+    payload list. Existing wire IDs/payloads are preserved; opt-in leased
+    lookup and renewal use appended request IDs and require a matching server.
 
     Args:
         message_queue_client: Existing ZMQ message queue client to wrap.
@@ -125,6 +126,18 @@ class ZmqMultiprocessClient(RequestClient):
     def lookup(self, key: Any, tp_size: int) -> MessagingFuture[Any]:
         """Start a prefix lookup."""
         return self._call(RequestType.LOOKUP, key, tp_size)
+
+    def lookup_leased(
+        self, key: Any, tp_size: int, credential: str
+    ) -> MessagingFuture[Any]:
+        """Start an opt-in lookup with a scheduler incarnation credential."""
+        return self._call(RequestType.LOOKUP_LEASED, key, tp_size, credential)
+
+    def renew_sessions(
+        self, credentials: list[tuple[str, str]]
+    ) -> MessagingFuture[Any]:
+        """Renew existing request sessions, returning accepted request IDs."""
+        return self._call(RequestType.RENEW_SESSIONS, credentials)
 
     def query_prefetch_status(self, request_id: str) -> MessagingFuture[Any]:
         """Query a prefetch task without blocking for completion."""

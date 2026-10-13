@@ -614,12 +614,15 @@ def transfer_kv_per_object_group(
             group_lmcache_chunk_size = cache_context.get_slots_per_chunk_in_sw(
                 kernel_group_id
             )
+            from lmcache.v1.multiprocess.transfer_context.base import (
+                _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR,
+            )
             tmp_gpu_buffers_batched = [
-                cache_context.get_temp_kernel_group_buffer(
-                    i, kernel_group_id
-                ).data_ptr()
+                cache_context.get_temp_kernel_group_buffer(i, kernel_group_id)
                 for i in range(batch_len)
             ]
+            if not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+                tmp_gpu_buffers_batched = [t.data_ptr() for t in tmp_gpu_buffers_batched]
             device_ops.multi_layer_block_kv_transfer(
                 group_kv_pointers,
                 tmp_gpu_buffers_batched,
@@ -1329,6 +1332,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         st = time.perf_counter()
 
+        # END may arrive while this RPC waits in the transfer queue. Owned
+        # Retrieve must not recreate the destroyed Session while resolving keys.
+        owned_reads = self._ctx.storage_manager.supports_owned_reads()
+        read_session = (
+            self._ctx.session_manager.get(key.request_id) if owned_reads else None
+        )
+        if owned_reads and read_session is None:
+            return b"", False
+
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
             # See store(): there is no completion event because no device work
@@ -1357,9 +1369,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
-        obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
-            key, list(range(num_object_groups))
-        )
+        if owned_reads:
+            obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+                key, list(range(num_object_groups)), session=read_session
+            )
+            if self._ctx.session_manager.get(key.request_id) is not read_session:
+                return b"", False
+        else:
+            obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+                key, list(range(num_object_groups))
+            )
         num_chunks = len(obj_keys_per_obj_group[0])
 
         # CPU-synchronous sentinel: a GPU retrieve is about to be enqueued.
@@ -1453,7 +1472,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 if g not in skipped_groups
             )
 
-            session = self._ctx.session_manager.get(key.request_id)
+            session = (
+                read_session
+                if owned_reads
+                else self._ctx.session_manager.get(key.request_id)
+            )
             owned_state = session.owned_read_state() if session is not None else None
             read_owner = session.owned_read_for(key) if owned_state is not None else None
             if (owned_state is not None or self._ctx.storage_manager.supports_owned_reads()) and read_owner is None:

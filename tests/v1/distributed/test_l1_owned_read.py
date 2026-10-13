@@ -147,3 +147,42 @@ def test_partial_tp_completion_does_not_reappear_after_expiry(manager):
         assert receipts is not None
         manager.finish_owned_read(list(receipts.values()))
     assert manager.delete([key])[key] == L1Error.SUCCESS
+
+
+@pytest.mark.parametrize("readers", [2, 8])
+def test_owned_partial_prefix_tail_preserves_common_and_other_owner(manager, readers):
+    common = [stored(manager, 10), stored(manager, 11)]
+    tail = [stored(manager, 12), stored(manager, 13)]
+    owner, other = ("partial", 1), ("other", 1)
+    manager.reserve_owned_read(common + tail, owner, readers)
+    manager.reserve_owned_read(tail, other, 1)
+
+    # The adapter's over-hit interval is cancelled twice to also check that
+    # duplicate control messages cannot consume another owner's reservation.
+    manager.cancel_owned_read(tail, owner)
+    manager.cancel_owned_read(tail, owner)
+    for key in common:
+        assert manager.get_object_state(key).read_leases.outstanding(owner) == readers
+    for key in tail:
+        leases = manager.get_object_state(key).read_leases
+        assert leases.outstanding(owner) == 0
+        assert leases.outstanding(other) == 1
+        assert manager.acquire_owned_read([key], owner, 0) is None
+        assert manager.delete([key])[key] == L1Error.KEY_IS_LOCKED
+
+    receipts = manager.acquire_owned_read(tail, other, 0)
+    assert receipts is not None
+    manager.finish_owned_read(list(receipts.values()))
+    assert all(value == L1Error.SUCCESS for value in manager.delete(tail).values())
+
+    for rank in range(readers):
+        receipts = manager.acquire_owned_read(common, owner, rank)
+        assert receipts is not None
+        manager.finish_owned_read(list(receipts.values()))
+        manager.finish_owned_read(list(receipts.values()))
+        expected = readers - rank - 1
+        for key in common:
+            assert manager.get_object_state(key).read_leases.outstanding(owner) == expected
+        if expected:
+            assert all(value == L1Error.KEY_IS_LOCKED for value in manager.delete(common).values())
+    assert all(value == L1Error.SUCCESS for value in manager.delete(common).values())

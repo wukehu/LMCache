@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional, overload
+import math
 import threading
 import time
 import uuid
@@ -323,16 +324,27 @@ class SessionManager:
 
     DEFAULT_SESSION_TTL = 600  # 10 minutes
     DEFAULT_CLEANUP_INTERVAL = 60.0
+    DEFAULT_MAX_LEASE_LIFETIME = 4 * 60 * 60
 
     def __init__(
         self,
         hasher: TokenHasher,
         ttl: float = DEFAULT_SESSION_TTL,
         cleanup_interval: float | None = DEFAULT_CLEANUP_INTERVAL,
+        max_lease_lifetime: float = DEFAULT_MAX_LEASE_LIFETIME,
     ) -> None:
+        if (
+            not math.isfinite(ttl) or ttl <= 0
+            or not math.isfinite(max_lease_lifetime) or max_lease_lifetime <= 0
+        ):
+            raise ValueError("session TTL and maximum lease lifetime must be positive")
         self._hasher = hasher
         self._ttl = ttl
+        self._max_lease_lifetime = max_lease_lifetime
         self._sessions: dict[str, Session] = {}
+        # request_id -> (lookup credential, bound_at, last_renewed), monotonic.
+        # Separate from native read-lock TTL; renewal never acquires read locks.
+        self._liveness: dict[str, tuple[str, float, float]] = {}
         self._lock = threading.Lock()
         #: Callbacks invoked for every destroyed session, so owners of
         #: per-request state (e.g. entries in ``Session.extras``) can release
@@ -380,24 +392,117 @@ class SessionManager:
                 return None
             session = self._sessions[request_id]
             del self._sessions[request_id]
+            self._liveness.pop(request_id, None)
             logger.debug("Removed session for request_id=%s", request_id)
         self._notify_destroyed(session)
         return session
 
+    def bind_liveness(self, request_id: str, credential: str) -> bool:
+        """Bind an existing session to one scheduler lookup credential.
+
+        This does not create sessions or replace a credential. Repeated binds
+        are idempotent and do not reset either deadline. An empty credential
+        is rejected. Explicit removal is required before reusing a request ID
+        for a new lookup lifetime.
+        """
+        if not credential:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            if request_id not in self._sessions:
+                return False
+            existing = self._liveness.get(request_id)
+            if existing is not None:
+                token, bound_at, renewed_at = existing
+                return (
+                    token == credential
+                    and now - renewed_at <= self._ttl
+                    and now - bound_at <= self._max_lease_lifetime
+                )
+            if time.time() - self._sessions[request_id].created_at > self._ttl:
+                return False
+            self._liveness[request_id] = (credential, now, now)
+            return True
+
+    def renew_sessions(self, credentials: list[tuple[str, str]]) -> list[str]:
+        """Renew live lookup sessions and return the accepted request IDs.
+
+        Each item is (request_id, lookup_credential). Missing, expired, foreign
+        or previous-incarnation credentials cannot create or revive a session.
+        The idle timeout is renewed; the maximum lifetime is never extended.
+        No read reservations or GPU receipts are acquired or released here.
+        """
+        now = time.monotonic()
+        renewed: list[str] = []
+        with self._lock:
+            for request_id, credential in credentials:
+                state = self._liveness.get(request_id)
+                if request_id not in self._sessions or state is None:
+                    continue
+                token, bound_at, renewed_at = state
+                if (
+                    credential != token
+                    or now - renewed_at > self._ttl
+                    or now - bound_at > self._max_lease_lifetime
+                ):
+                    continue
+                self._liveness[request_id] = (token, bound_at, now)
+                renewed.append(request_id)
+        return renewed
+
+    def read_lease_deadline(
+        self, session: Session, *, credential: str | None = None
+    ) -> float | None:
+        """Return this exact Session's bounded deadline, or None for legacy.
+
+        No credential is created or renewed here. Removed/replaced sessions
+        and expired authenticated lifetimes fail closed. The caller serializes
+        reservation publication with Session destruction before using it.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._sessions.get(session.request_id) is not session:
+                raise RuntimeError("lookup Session is no longer current")
+            state = self._liveness.get(session.request_id)
+            if credential is not None and (state is None or state[0] != credential):
+                raise RuntimeError("lookup Session credential is no longer current")
+            if state is None:
+                return None
+            _, bound_at, renewed_at = state
+            deadline = min(renewed_at + self._ttl, bound_at + self._max_lease_lifetime)
+            if deadline <= now:
+                raise RuntimeError("lookup Session lease has expired")
+            return deadline
+
     def cleanup_expired(self) -> int:
-        """Remove sessions that have exceeded their TTL.
+        """Remove idle/over-age leased sessions and age-expired legacy sessions.
+
+        Leased sessions use a monotonic idle deadline plus an unextendable
+        lifetime. Sessions without a scheduler credential retain legacy TTL
+        semantics. All removal paths invoke the same destroy listeners.
 
         Returns:
             Number of sessions removed.
         """
         now = time.time()
+        monotonic_now = time.monotonic()
         expired: list[Session] = []
         with self._lock:
             for session in self._sessions.values():
-                if now - session.created_at > self._ttl:
+                state = self._liveness.get(session.request_id)
+                if state is None:
+                    is_expired = now - session.created_at > self._ttl
+                else:
+                    _, bound_at, renewed_at = state
+                    is_expired = (
+                        monotonic_now - renewed_at > self._ttl
+                        or monotonic_now - bound_at > self._max_lease_lifetime
+                    )
+                if is_expired:
                     expired.append(session)
             for session in expired:
                 del self._sessions[session.request_id]
+                self._liveness.pop(session.request_id, None)
 
         for session in expired:
             self._notify_destroyed(session)

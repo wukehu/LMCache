@@ -1,0 +1,225 @@
+{
+  "component": "lmcache",
+  "branch": "release-sp3",
+  "base_commit": "b2dfb89963791d9b57dde2c720592bcb7bf49a0e",
+  "image": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp3",
+  "image_digest": "sha256:d8d83d33c73f7f9e4f2cff478e5bd9167e124f66ee26208f81910b49aca6064c",
+  "source_files": {
+    "lmcache/integration/vllm/lmcache_mp_connector.py": "d7b292f8ea787ed10574816cf6a19394cc9d39515009d0bd4647a9a98992371c",
+    "lmcache/integration/vllm/lmcache_mp_metadata.py": "44f67f1ecc30bedfd1982cc48774838aa8f8e522c277a723ded5c66f64c70674",
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": "b6f8cf846ddf0f08f890959b57c82821daede43262f80a975d9e86cd214e8c69",
+    "lmcache/v1/distributed/api.py": "5ba00e310c449d78396fa58920db7da979ba4036eba3adfbbea2f557c4dd4a6c",
+    "lmcache/v1/distributed/l1_manager.py": "67d67300c9b0457f2918c297415900d374609b00f89226659228d99459eab167",
+    "lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py": "f961bd86074b4082ab6b209e31fedcb9a9fa7b773bbb07495ec253725c9e5c35",
+    "lmcache/v1/distributed/read_lease.py": "ed655b8927c51aef20bab2099eff546d9eab92ecb4eaa6bc634d218a81a0e732",
+    "lmcache/v1/distributed/storage_manager.py": "34bebb0d3ea4a44df99380db32a6cd06dd3aa7012acc6cdc039c1cc7f986161f",
+    "lmcache/v1/multiprocess/engine_context.py": "2a8ee447cc81e50742076574500e2e65aba56594fe43287de0ece8c6428c96b6",
+    "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py": "4e9edd5f8a6237070dfc7ce0d71da86cb61c16e792dd7e8d94c4b4733ff62967",
+    "lmcache/v1/multiprocess/modules/lookup.py": "b303403937e2213ba10b3484a27dc934cd2cbcc22725904324078c0928e9a969",
+    "lmcache/v1/multiprocess/protocols/base.py": "67e92e45ef0e9b5da9b5c1ccce3d1f31208b714fc3007474d1f752f7763a1982",
+    "lmcache/v1/multiprocess/protocols/engine.py": "a41ff751b9035b6cc9ef36f3ef6173df714ef092acb6a9fe8d3f546e8c440f08",
+    "lmcache/v1/multiprocess/session.py": "f639101ac62c8b936fe9b5ffb352c7c07844d45e186a7d41be266cfc9862a422",
+    "lmcache/v1/multiprocess/transport/base.py": "2eaec66826a0dd3aefb0ac5cc4501ed12b9271803bdf513b91dd24d89fff0b82",
+    "lmcache/v1/multiprocess/transport/zmq_impl/client.py": "aad93582219e1769db4bc61266df01053d678fefae5cd3a2c3b0ef7036578ea3",
+    "lmcache/v1/multiprocess/transport/zmq_impl/server.py": "91bb9035c907d4c31350f6e8dc3ea7322289204d58f764f2114c7a1fd761d7ec",
+    "lmcache/v1/mp_observability/fs_inventory.py": "598d22bbf6bdc866e38589bad4f541c54483cd608314039ac68ff631fa6b606f"
+  },
+  "PP_gt_1_experimental_included": false,
+  "tests": {
+    "tests/v1/distributed/test_capacity_observations.py": "387610c3f169e147d027de5845666034e5fb8fe935ec74435d68dc4235377a00",
+    "tests/v1/distributed/test_fs_inventory.py": "571b7772952884368329b01a6920055453e14b1b89ce8fb66aa3acf6da1fc71b",
+    "tests/v1/distributed/test_l1_owned_read.py": "411773acc0f11b51fb6d680928f58802dcf3be9ed828e43ffb1eb5e7ae30e02e",
+    "tests/v1/distributed/test_owned_source_coexistence.py": "77900d67df56ada77770429973a82f8238fb29f310d78f8b561cceed5531ddaf",
+    "tests/v1/distributed/test_read_lease.py": "006f54ca9fcb62dd1f9e01a4870d2f439a7a57e8cbc450ba2271545b277d1160",
+    "tests/v1/multiprocess/test_late_owned_retrieve.py": "6fc3b9ce0d97cb1e4071b2e03ec516f744ca13c7674ecad3ba7a5bdcb8426ef6",
+    "tests/v1/multiprocess/test_lookup_queue_residency.py": "72571d05d8328072cf27f744bd35b1e455108d60445424066743d22bccb90439",
+    "tests/v1/multiprocess/test_lookup_session_cancellation.py": "c7d88035d66ea547cb46b4507f65ed22ef924f888d3eb0a74c4cd8225ccb493c",
+    "tests/v1/multiprocess/test_protocols.py": "1d21207cfbc6bc172b20a546c3cb580da5a8b5d777fdc4247080e964f4eb0d5b",
+    "tests/v1/multiprocess/test_session_liveness.py": "8dfca6a09d45b85fbee3f7a3e586548b95075ce3234c48707aaf3b2cc9475b93",
+    "tests/v1/multiprocess/test_session_liveness_wire.py": "0da12eaa5684e66549b4a776ec6dd113d65013ba0c3e99ea59a80f7814237c12",
+    "tests/v1/test_lazy_offload_pending_store.py": "1e78ae7d519ccdd107b3e1fb7a2593499ee2817700b0546e5148f9a2614a78fe",
+    "tests/v1/test_lmcache_mp_connector.py": "fd230a7cdb84053300150aa5a350f099243d697fdb3e29ee23c2967354b67526",
+    "tests/v1/test_mp_connector_layout_preference.py": "3e93a1a5e0b671137a119a5ff7199e1500d53148c37be0543b6bdd848db6b8bd",
+    "tests/v1/test_mp_connector_mm_keys.py": "b5cea3731074ba959271decaa00706d63c4d9bf73c8a1e2ae17bc41c5422e41c",
+    "tests/v1/test_mp_nonblocking_lookup.py": "16bed819db2693e42f0f75f0178d05f06b6e07cbd12b245bad8a8fec85a4b0ac",
+    "tests/v1/test_mp_session_renewal.py": "c35152697ab928f99be8a692735140d532341eb6e3f40e55eadefd8cb79bc4f8",
+    "tests/v1/test_vllm_mp_adapter.py": "87baf20fc7e58955c1260731d261f57fdb5fc0dbac62ab6de37aa3fa0c44df4f"
+  },
+  "already_in_base_and_verified": [
+    "lmcache/v1/multiprocess/transfer_context/base.py",
+    "lmcache/v1/distributed/read_completion.py",
+    "lmcache/v1/mp_observability/source_attribution.py",
+    "lmcache/v1/distributed/storage_controllers/prefetch_controller.py"
+  ],
+  "installed_python_files": {
+    "lmcache/integration/vllm/lmcache_mp_connector.py": "d7b292f8ea787ed10574816cf6a19394cc9d39515009d0bd4647a9a98992371c",
+    "lmcache/integration/vllm/lmcache_mp_metadata.py": "44f67f1ecc30bedfd1982cc48774838aa8f8e522c277a723ded5c66f64c70674",
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": "b6f8cf846ddf0f08f890959b57c82821daede43262f80a975d9e86cd214e8c69",
+    "lmcache/v1/distributed/api.py": "5ba00e310c449d78396fa58920db7da979ba4036eba3adfbbea2f557c4dd4a6c",
+    "lmcache/v1/distributed/l1_manager.py": "67d67300c9b0457f2918c297415900d374609b00f89226659228d99459eab167",
+    "lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py": "8b57d28da8abb7398436535e34f4fe1823ec3838fadd823a8c879f3af6980969",
+    "lmcache/v1/distributed/read_lease.py": "ed655b8927c51aef20bab2099eff546d9eab92ecb4eaa6bc634d218a81a0e732",
+    "lmcache/v1/distributed/storage_manager.py": "0e8739c9af8f10d0de98ff41eed0b54f227809cea7c28e1a2a69a79267b47f3f",
+    "lmcache/v1/multiprocess/engine_context.py": "2a8ee447cc81e50742076574500e2e65aba56594fe43287de0ece8c6428c96b6",
+    "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py": "4e9edd5f8a6237070dfc7ce0d71da86cb61c16e792dd7e8d94c4b4733ff62967",
+    "lmcache/v1/multiprocess/modules/lookup.py": "b303403937e2213ba10b3484a27dc934cd2cbcc22725904324078c0928e9a969",
+    "lmcache/v1/multiprocess/protocols/base.py": "67e92e45ef0e9b5da9b5c1ccce3d1f31208b714fc3007474d1f752f7763a1982",
+    "lmcache/v1/multiprocess/protocols/engine.py": "a41ff751b9035b6cc9ef36f3ef6173df714ef092acb6a9fe8d3f546e8c440f08",
+    "lmcache/v1/multiprocess/session.py": "f639101ac62c8b936fe9b5ffb352c7c07844d45e186a7d41be266cfc9862a422",
+    "lmcache/v1/multiprocess/transport/base.py": "2eaec66826a0dd3aefb0ac5cc4501ed12b9271803bdf513b91dd24d89fff0b82",
+    "lmcache/v1/multiprocess/transport/zmq_impl/client.py": "aad93582219e1769db4bc61266df01053d678fefae5cd3a2c3b0ef7036578ea3",
+    "lmcache/v1/multiprocess/transport/zmq_impl/server.py": "91bb9035c907d4c31350f6e8dc3ea7322289204d58f764f2114c7a1fd761d7ec",
+    "lmcache/v1/mp_observability/fs_inventory.py": "2975b92b9b2bf14446d65b3d422b69d3e1701e6a985ae59a906d99c7ef4b9ed8"
+  },
+  "image_line_endings": {
+    "lmcache/integration/vllm/lmcache_mp_connector.py": "lf",
+    "lmcache/integration/vllm/lmcache_mp_metadata.py": "lf",
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": "lf",
+    "lmcache/v1/distributed/api.py": "lf",
+    "lmcache/v1/distributed/l1_manager.py": "lf",
+    "lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py": "crlf",
+    "lmcache/v1/distributed/read_lease.py": "lf",
+    "lmcache/v1/distributed/storage_manager.py": "crlf",
+    "lmcache/v1/multiprocess/engine_context.py": "lf",
+    "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py": "lf",
+    "lmcache/v1/multiprocess/modules/lookup.py": "lf",
+    "lmcache/v1/multiprocess/protocols/base.py": "lf",
+    "lmcache/v1/multiprocess/protocols/engine.py": "lf",
+    "lmcache/v1/multiprocess/session.py": "lf",
+    "lmcache/v1/multiprocess/transport/base.py": "lf",
+    "lmcache/v1/multiprocess/transport/zmq_impl/client.py": "lf",
+    "lmcache/v1/multiprocess/transport/zmq_impl/server.py": "lf",
+    "lmcache/v1/mp_observability/fs_inventory.py": "crlf"
+  },
+  "source_normalization": "Git source uses LF. Reconstruct image CRLF only for files explicitly listed as crlf when creating an overlay; source text is identical.",
+  "overlay_files": {
+    "lmcache/integration/vllm/lmcache_mp_connector.py": {
+      "git_lf_sha256": "d7b292f8ea787ed10574816cf6a19394cc9d39515009d0bd4647a9a98992371c",
+      "image_sha256": "d7b292f8ea787ed10574816cf6a19394cc9d39515009d0bd4647a9a98992371c",
+      "image_eol": "lf"
+    },
+    "lmcache/integration/vllm/lmcache_mp_metadata.py": {
+      "git_lf_sha256": "44f67f1ecc30bedfd1982cc48774838aa8f8e522c277a723ded5c66f64c70674",
+      "image_sha256": "44f67f1ecc30bedfd1982cc48774838aa8f8e522c277a723ded5c66f64c70674",
+      "image_eol": "lf"
+    },
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": {
+      "git_lf_sha256": "b6f8cf846ddf0f08f890959b57c82821daede43262f80a975d9e86cd214e8c69",
+      "image_sha256": "b6f8cf846ddf0f08f890959b57c82821daede43262f80a975d9e86cd214e8c69",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/distributed/api.py": {
+      "git_lf_sha256": "5ba00e310c449d78396fa58920db7da979ba4036eba3adfbbea2f557c4dd4a6c",
+      "image_sha256": "5ba00e310c449d78396fa58920db7da979ba4036eba3adfbbea2f557c4dd4a6c",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/distributed/l1_manager.py": {
+      "git_lf_sha256": "67d67300c9b0457f2918c297415900d374609b00f89226659228d99459eab167",
+      "image_sha256": "67d67300c9b0457f2918c297415900d374609b00f89226659228d99459eab167",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/distributed/read_completion.py": {
+      "git_lf_sha256": "21cb77148635d052e92c2274413b8c21de10d7dd33fe1c6e14c520ae2a5bcd0c",
+      "image_sha256": "21cb77148635d052e92c2274413b8c21de10d7dd33fe1c6e14c520ae2a5bcd0c",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/distributed/read_lease.py": {
+      "git_lf_sha256": "ed655b8927c51aef20bab2099eff546d9eab92ecb4eaa6bc634d218a81a0e732",
+      "image_sha256": "ed655b8927c51aef20bab2099eff546d9eab92ecb4eaa6bc634d218a81a0e732",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/distributed/storage_manager.py": {
+      "git_lf_sha256": "34bebb0d3ea4a44df99380db32a6cd06dd3aa7012acc6cdc039c1cc7f986161f",
+      "image_sha256": "0e8739c9af8f10d0de98ff41eed0b54f227809cea7c28e1a2a69a79267b47f3f",
+      "image_eol": "crlf"
+    },
+    "lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py": {
+      "git_lf_sha256": "f961bd86074b4082ab6b209e31fedcb9a9fa7b773bbb07495ec253725c9e5c35",
+      "image_sha256": "8b57d28da8abb7398436535e34f4fe1823ec3838fadd823a8c879f3af6980969",
+      "image_eol": "crlf"
+    },
+    "lmcache/v1/distributed/storage_controllers/prefetch_controller.py": {
+      "git_lf_sha256": "78afc085bfc94880c886d4ae16cbe15d8232112a228da2f6335e2d8fa0cc09a1",
+      "image_sha256": "78afc085bfc94880c886d4ae16cbe15d8232112a228da2f6335e2d8fa0cc09a1",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/mp_observability/fs_inventory.py": {
+      "git_lf_sha256": "598d22bbf6bdc866e38589bad4f541c54483cd608314039ac68ff631fa6b606f",
+      "image_sha256": "2975b92b9b2bf14446d65b3d422b69d3e1701e6a985ae59a906d99c7ef4b9ed8",
+      "image_eol": "crlf"
+    },
+    "lmcache/v1/mp_observability/source_attribution.py": {
+      "git_lf_sha256": "4190c8ec3c6d4575abd11ff0cdc314eb18a1b1e8373261a2cfa625e7a7518a7c",
+      "image_sha256": "4190c8ec3c6d4575abd11ff0cdc314eb18a1b1e8373261a2cfa625e7a7518a7c",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/engine_context.py": {
+      "git_lf_sha256": "2a8ee447cc81e50742076574500e2e65aba56594fe43287de0ece8c6428c96b6",
+      "image_sha256": "2a8ee447cc81e50742076574500e2e65aba56594fe43287de0ece8c6428c96b6",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/session.py": {
+      "git_lf_sha256": "f639101ac62c8b936fe9b5ffb352c7c07844d45e186a7d41be266cfc9862a422",
+      "image_sha256": "f639101ac62c8b936fe9b5ffb352c7c07844d45e186a7d41be266cfc9862a422",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py": {
+      "git_lf_sha256": "4e9edd5f8a6237070dfc7ce0d71da86cb61c16e792dd7e8d94c4b4733ff62967",
+      "image_sha256": "4e9edd5f8a6237070dfc7ce0d71da86cb61c16e792dd7e8d94c4b4733ff62967",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/modules/lookup.py": {
+      "git_lf_sha256": "b303403937e2213ba10b3484a27dc934cd2cbcc22725904324078c0928e9a969",
+      "image_sha256": "b303403937e2213ba10b3484a27dc934cd2cbcc22725904324078c0928e9a969",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/protocols/base.py": {
+      "git_lf_sha256": "67e92e45ef0e9b5da9b5c1ccce3d1f31208b714fc3007474d1f752f7763a1982",
+      "image_sha256": "67e92e45ef0e9b5da9b5c1ccce3d1f31208b714fc3007474d1f752f7763a1982",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/protocols/engine.py": {
+      "git_lf_sha256": "a41ff751b9035b6cc9ef36f3ef6173df714ef092acb6a9fe8d3f546e8c440f08",
+      "image_sha256": "a41ff751b9035b6cc9ef36f3ef6173df714ef092acb6a9fe8d3f546e8c440f08",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/transport/base.py": {
+      "git_lf_sha256": "2eaec66826a0dd3aefb0ac5cc4501ed12b9271803bdf513b91dd24d89fff0b82",
+      "image_sha256": "2eaec66826a0dd3aefb0ac5cc4501ed12b9271803bdf513b91dd24d89fff0b82",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/transport/zmq_impl/client.py": {
+      "git_lf_sha256": "aad93582219e1769db4bc61266df01053d678fefae5cd3a2c3b0ef7036578ea3",
+      "image_sha256": "aad93582219e1769db4bc61266df01053d678fefae5cd3a2c3b0ef7036578ea3",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/transport/zmq_impl/server.py": {
+      "git_lf_sha256": "91bb9035c907d4c31350f6e8dc3ea7322289204d58f764f2114c7a1fd761d7ec",
+      "image_sha256": "91bb9035c907d4c31350f6e8dc3ea7322289204d58f764f2114c7a1fd761d7ec",
+      "image_eol": "lf"
+    },
+    "lmcache/v1/multiprocess/transfer_context/base.py": {
+      "git_lf_sha256": "b62f6398adb87d99a87911b241fa6399a7f4d51cd956af4ba2d1d1466566217e",
+      "image_sha256": "b62f6398adb87d99a87911b241fa6399a7f4d51cd956af4ba2d1d1466566217e",
+      "image_eol": "lf"
+    }
+  },
+  "delivery_kind": "SP3 source archive; native clean rebuild and production acceptance are separate",
+  "validation": {
+    "python_source_image_byte_verification": "passed via explicit newline reconstruction",
+    "diff_check": "passed",
+    "native_clean_rebuild": "not performed",
+    "numerical_equivalence": "deferred",
+    "cpu_regression": {
+      "passed": 230,
+      "subtests_passed": 4,
+      "collection_errors": 2,
+      "blocked_files": [
+        "tests/v1/multiprocess/test_protocols.py",
+        "tests/v1/multiprocess/test_session_liveness_wire.py"
+      ],
+      "reason": "Mooncake import requires libcuda.so.1 missing from GPU-disabled container",
+      "strict_suite_passed": false
+    }
+  }
+}

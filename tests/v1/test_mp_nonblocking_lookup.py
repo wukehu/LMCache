@@ -71,6 +71,10 @@ class Client:
         self.lookups.append(key)
         return self.ack
 
+    def ping(self, instance_id: int | None) -> MessagingFuture[Any]:
+        """Reply to scheduler health checks without transport or GPU work."""
+        return ready(True)
+
     def query_prefetch_status(self, request_id: str) -> MessagingFuture[Any]:
         """Return the next explicitly prepared status response."""
         self.queries.append(request_id)

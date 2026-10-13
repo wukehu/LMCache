@@ -48,6 +48,8 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "LOOKUP_LEASED",
+    "RENEW_SESSIONS",
 ]
 
 # Type alias for cache keys
@@ -62,6 +64,17 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         Dictionary mapping request names to their protocol definitions
     """
     return {
+        # Opt-in scheduler liveness; legacy LOOKUP payload/response unchanged.
+        "LOOKUP_LEASED": ProtocolDefinition(
+            payload_classes=[KeyType, int, str],
+            response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "RENEW_SESSIONS": ProtocolDefinition(
+            payload_classes=[list[tuple[str, str]]],
+            response_class=list[str],
+            handler_type=HandlerType.SYNC,
+        ),
         # Register KV Cache
         # Payload:
         #   - instance_id: int - Unique identifier for the engine instance

@@ -122,3 +122,44 @@ def test_cancelled_active_owner_is_retired_after_its_callback():
     assert ledger.outstanding('A') == 0
     assert ledger.forget('A')
     assert not ledger.complete(token)
+
+
+def test_renewal_preserves_partial_reader_counts_and_completion_identity():
+    ledger = ReadLeaseLedger()
+    ledger.reserve('A', 3, 1)
+    first = ledger.acquire('A', 0)
+    assert ledger.complete(first)
+    active = ledger.acquire('A', 1)
+    assert ledger.renew('A', 20)
+    assert ledger.outstanding('A') == 2
+    assert not ledger.complete(first)
+    assert ledger.acquire('A', 0) is None
+    assert ledger.complete(active)
+    assert ledger.abandon('A', 2)
+    assert not ledger.renew('A', 100)
+    assert not ledger.is_pinned(5)
+
+
+def test_renewal_does_not_revive_cancelled_or_unknown_owners():
+    ledger = ReadLeaseLedger()
+    ledger.reserve('A', 2, 1)
+    active = ledger.acquire('A', 0)
+    assert ledger.cancel('A')
+    assert not ledger.renew('A', 100)
+    assert not ledger.renew('B', 100)
+    assert ledger.outstanding('A') == 1
+    assert ledger.is_pinned(1000)
+    assert ledger.complete(active)
+    assert not ledger.renew('A', 100)
+    assert not ledger.is_pinned(0)
+
+
+def test_renewal_never_shortens_deadline_or_accepts_nonfinite_values():
+    ledger = ReadLeaseLedger()
+    ledger.reserve('A', 1, 10)
+    assert ledger.renew('A', 2)
+    assert ledger.is_pinned(9)
+    for deadline in (float('inf'), float('-inf'), float('nan')):
+        with pytest.raises(ValueError):
+            ledger.renew('A', deadline)
+    assert ledger.outstanding('A') == 1

@@ -23,7 +23,7 @@ from lmcache.v1.gpu_connector.gds_context import (
 )
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.session import Session, SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
@@ -277,7 +277,11 @@ class MPCacheServerContext:
         return self._layout_desc_registry
 
     def resolve_obj_keys(
-        self, key: IPCCacheServerKey, object_group_ids: list[int]
+        self,
+        key: IPCCacheServerKey,
+        object_group_ids: list[int],
+        *,
+        session: Session | None = None,
     ) -> list[list[ObjectKey]]:
         """Resolve per-object-group object keys from an IPC cache key.
 
@@ -287,6 +291,9 @@ class MPCacheServerContext:
         Args:
             key: IPC cache key describing model/session/token range.
             object_group_ids: Object group ids to produce keys for.
+            session: Captured existing session for owned Retrieve. Supplying it
+                prevents a late call from recreating cancelled ownership. Other
+                callers retain the original get-or-create behavior.
 
         Returns:
             The i-th element is the list of ObjectKeys for
@@ -295,7 +302,8 @@ class MPCacheServerContext:
         Raises:
             ValueError: If ``key.worker_id`` is ``None``.
         """
-        session = self.session_manager.get_or_create(key.request_id)
+        if session is None:
+            session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         if session.lookup_ipc_key is None:
             session.lookup_ipc_key = key.no_worker_id_version()

@@ -64,6 +64,14 @@ class RequestClient(Protocol):
 
     def lookup(self, key: Any, tp_size: int) -> MessagingFuture[Any]: ...
 
+    def lookup_leased(
+        self, key: Any, tp_size: int, credential: str
+    ) -> MessagingFuture[Any]: ...
+
+    def renew_sessions(
+        self, credentials: list[tuple[str, str]]
+    ) -> MessagingFuture[Any]: ...
+
     def query_prefetch_status(self, request_id: str) -> MessagingFuture[Any]: ...
 
     def wait_prefetch_status(

@@ -484,6 +484,15 @@ class HeartbeatThread(PeriodicThread):
             return True
 
         self._recover_callback: Callable[[], bool] = noop
+        self._periodic_callback: Callable[[], bool] = noop
+
+    def register_periodic_callback(self, callback: Callable[[], bool]) -> None:
+        """Run bounded request-liveness work after each successful health ping.
+
+        The callback runs on this thread, must not raise, and returns whether
+        its RPC round trip succeeded. Worker adapters leave it as a no-op.
+        """
+        self._periodic_callback = callback
 
     def register_recover_callback(self, callback: Callable[[], bool]) -> None:
         """Register a callback fired on the unhealthy->healthy transition.
@@ -537,6 +546,10 @@ class HeartbeatThread(PeriodicThread):
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
 
+        if healthy:
+            healthy = self._periodic_callback()
+        if self.stop_requested:
+            return ThreadRunSummary(success=True, message="stopped after liveness RPC")
         if healthy:
             self._health_event.set()
             if not was_healthy:
@@ -730,6 +743,18 @@ class LMCacheMPSchedulerAdapter:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
+        self._scheduler_closed = False
+        self._leased_lookup = os.environ.get("LMCACHE_MP_OWNED_READ_LEASE") == "1"
+        self._session_lease_lock = threading.Lock()
+        self._session_leases: dict[
+            str, tuple[str, dict[str, MessagingFuture[Any]]]
+        ] = {}
+        if self._leased_lookup and any(
+            not hasattr(client, "lookup_leased")
+            or not hasattr(client, "renew_sessions")
+            for client in self.req_clients.values()
+        ):
+            raise ValueError("owned session liveness requires the leased ZMQ client")
 
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.
@@ -753,10 +778,8 @@ class LMCacheMPSchedulerAdapter:
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
-        if self._heartbeats is not None:
-            return
         with self._heartbeat_lock:
-            if self._heartbeats is not None:
+            if self._heartbeats or self._scheduler_closed:
                 return
             for url, client in self.req_clients.items():
                 hb = HeartbeatThread(
@@ -764,8 +787,46 @@ class LMCacheMPSchedulerAdapter:
                     health_event=self._health_events[url],
                     interval=self._heartbeat_interval,
                 )
-                hb.start()
+                if self._leased_lookup:
+                    hb.register_periodic_callback(
+                        lambda url=url: self._renew_lookup_sessions(url)
+                    )
                 self._heartbeats[url] = hb
+                hb.start()
+
+    def _renew_lookup_sessions(self, url: str) -> bool:
+        """Renew acknowledged lookups, retaining them through GPU allocation.
+
+        Lookup-result cleanup is not request completion: credentials are kept
+        until end_session. A snapshot may race END_SESSION; the server rejects
+        such late renewals without creating any new ownership state.
+        """
+        with self._session_lease_lock:
+            credentials = [
+                (request_id, token)
+                for request_id, (token, futures) in self._session_leases.items()
+                if futures[url].query()
+            ]
+        try:
+            for offset in range(0, len(credentials), 256):
+                batch = credentials[offset : offset + 256]
+                accepted = self.req_clients[url].renew_sessions(batch).result(
+                    timeout=self._heartbeat_interval
+                )
+                missing = {request_id for request_id, _ in batch} - set(accepted)
+                # Remove IDs that completed while this round trip was running.
+                with self._session_lease_lock:
+                    missing.intersection_update(self._session_leases)
+                if missing:
+                    logger.error(
+                        "Session renewal rejected server=%s request_ids=%s; "
+                        "lookup ownership cannot be revived",
+                        url, sorted(missing),
+                    )
+            return True
+        except Exception:
+            logger.exception("Session renewal RPC failed server=%s", url)
+            return False
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -803,7 +864,7 @@ class LMCacheMPSchedulerAdapter:
         """
         self._ensure_heartbeat_started()
 
-        if not self.is_healthy:
+        if self._scheduler_closed or not self.is_healthy:
             return
 
         if request_id in self._pending_lookups:
@@ -823,10 +884,21 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
 
-        futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
-            for url in self._server_urls
-        }
+        if self._leased_lookup:
+            with self._session_lease_lock:
+                existing = self._session_leases.get(request_id)
+                credential = existing[0] if existing is not None else uuid.uuid4().hex
+            futures = {
+                url: self.req_clients[url].lookup_leased(key, self.tp_size, credential)
+                for url in self._server_urls
+            }
+            with self._session_lease_lock:
+                self._session_leases[request_id] = (credential, futures)
+        else:
+            futures = {
+                url: self.req_clients[url].lookup(key, self.tp_size)
+                for url in self._server_urls
+            }
 
         # Do not wait for the acknowledgement here: that is a full server
         # round trip on the scheduler thread. check_lookup_result resolves
@@ -1013,11 +1085,15 @@ class LMCacheMPSchedulerAdapter:
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
+        with self._heartbeat_lock:
+            self._scheduler_closed = True
+            heartbeats = list(self._heartbeats.values())
+        for hb in heartbeats:
+            hb.stop()
+        with self._session_lease_lock:
+            self._session_leases.clear()
         for client in self.req_clients.values():
             client.close()
-        with self._heartbeat_lock:
-            for hb in self._heartbeats.values():
-                hb.stop()
 
     def free_lookup_locks(
         self,
@@ -1076,6 +1152,8 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
+        with self._session_lease_lock:
+            self._session_leases.pop(request_id, None)
         if not self.is_healthy:
             return
 
@@ -1292,6 +1370,11 @@ class LMCacheMPWorkerAdapter:
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         self._dropped_retrieves: set[str] = set()
+        # Scheduler-confirmed aborts that occurred while a retrieve was in
+        # flight. This marker survives the window where a worker has already
+        # reported finished_recving and removed the retrieve future, but sees
+        # the engine-finished request ID in a later step.
+        self._aborted_retrieves: set[str] = set()
 
         # The store requests that have finished execution in LMCache
         self.finished_stores: set[str] = set()
@@ -1442,6 +1525,8 @@ class LMCacheMPWorkerAdapter:
             layout_hints if layout_hints is not None else vllm_layout_hints()
         )
         self._send_register_kv_caches_request(kv_caches)
+        # Keep idle registrations alive before the first cache operation.
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1490,8 +1575,10 @@ class LMCacheMPWorkerAdapter:
             ) from None
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start the heartbeat once, after registration or on cache traffic.
 
+        Registration starts it before an idle worker can be reaped. The
+        store/retrieve calls remain idempotent guards for existing callers.
         The heartbeat starts healthy (the event was set at construction). A
         live worker pings every interval, refreshing its server-side
         ``last_seen``, so it is never reaped while alive -- no re-registration
@@ -1824,6 +1911,21 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def mark_aborted_retrieves(self, request_ids: set[str]) -> None:
+        """Record scheduler-confirmed aborts of in-flight retrieves.
+
+        Args:
+            request_ids: Request IDs aborted while their retrieve was active.
+
+        Returns:
+            None.
+
+        Notes:
+            Markers persist across ``get_finished()`` calls until the matching
+            engine-finished notification is observed.
+        """
+        self._aborted_retrieves.update(request_ids)
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -1878,7 +1980,10 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.update(dropped)
 
             ret_stores = self._process_finished_stores(
-                finished_stores, finished_req_ids_from_engine
+                finished_stores,
+                finished_req_ids_from_engine
+                - finished_retrieves
+                - self._aborted_retrieves,
             )
             # A request may have a pending retrieve AND appear in
             # finished_req_ids_from_engine (it ran without loading KV after
@@ -1886,6 +1991,9 @@ class LMCacheMPWorkerAdapter:
             # first and deletes the request, so we must not also report it
             # in finished_sending.
             ret_stores -= finished_retrieves
+            handled_aborts = finished_req_ids_from_engine & self._aborted_retrieves
+            self._returned_finished.update(handled_aborts)
+            self._aborted_retrieves.difference_update(handled_aborts)
             return ret_stores, finished_retrieves
 
         finished_stores = set()
@@ -1938,10 +2046,20 @@ class LMCacheMPWorkerAdapter:
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
 
+        # An engine-finished request can still have a retrieve in flight after
+        # an abort. It has no store completion for the scheduler to wait on;
+        # reporting both directions would let recv free the request before
+        # the scheduler processes send.
+        retrieving_req_ids = set(self.retrieve_futures) | finished_retrieves
+
         # Update the internal states
         ret_stores = self._process_finished_stores(
-            finished_stores, finished_req_ids_from_engine
+            finished_stores,
+            finished_req_ids_from_engine - retrieving_req_ids - self._aborted_retrieves,
         )
+        handled_aborts = finished_req_ids_from_engine & self._aborted_retrieves
+        self._returned_finished.update(handled_aborts)
+        self._aborted_retrieves.difference_update(handled_aborts)
 
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.

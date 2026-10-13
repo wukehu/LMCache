@@ -22,6 +22,7 @@ from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
@@ -98,6 +99,8 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # Owned L1 lookups retain the exact lifetime, never a request-ID replacement.
+    owned_session: Session | None = None
 
 
 class LookupModule:
@@ -116,14 +119,12 @@ class LookupModule:
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
-        self._ctx.session_manager.destroy_listeners.append(
-            lambda session: self._cancel_owned_session(session, final=True)
-        )
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._ctx.session_manager.destroy_listeners.append(self._destroy_owned_session)
         self._setup_metrics()
 
-    def _cancel_owned_session(self, session, final: bool = False) -> None:
+    def _cancel_owned_session(self, session: Session, final: bool = False) -> None:
         session.cancel_owned_reads(self._ctx.storage_manager.cancel_owned_read, final)
 
     @property
@@ -149,6 +150,48 @@ class LookupModule:
     # Handlers
     # -----------------------------------------------------------------
 
+    def lookup_leased(
+        self, key: IPCCacheServerKey, tp_size: int, credential: str
+    ) -> None:
+        """Start lookup with bounded scheduler liveness for owned-read mode.
+
+        The credential identifies this lookup incarnation, not cache content.
+        Binding precedes publication of read reservations. Unsupported storage
+        modes and conflicting/expired sessions fail before performing lookup.
+        """
+        if not self._ctx.storage_manager.supports_owned_reads():
+            raise ValueError("leased lookup requires owned-read storage")
+        self._ctx.session_manager.get_or_create(key.request_id)
+        if not self._ctx.session_manager.bind_liveness(key.request_id, credential):
+            raise ValueError("lookup session credential is not active")
+        self.lookup(key, tp_size)
+
+    def renew_sessions(self, credentials: list[tuple[str, str]]) -> list[str]:
+        """Renew live Sessions and their exact pending reservations, not counts."""
+        renewed = set(self._ctx.session_manager.renew_sessions(credentials))
+        accepted = []
+        for request_id, credential in credentials:
+            if request_id not in renewed or request_id in accepted:
+                continue
+            session = self._ctx.session_manager.get(request_id)
+            if session is None:
+                continue
+            owned = session.owned_read_state()
+            owner, keys = owned if owned is not None else (None, ())
+            try:
+                with session.owned_reservation_scope(owner):
+                    deadline = self._ctx.session_manager.read_lease_deadline(
+                        session, credential=credential
+                    )
+                    if deadline is not None and keys:
+                        self._ctx.storage_manager.renew_owned_read(list(keys), owner, deadline)
+            except RuntimeError:
+                # Cancellation or expiry can win after authentication. Never
+                # publish into a replacement Session or acknowledge revival.
+                continue
+            accepted.append(request_id)
+        return accepted
+
     def lookup(
         self,
         key: IPCCacheServerKey,
@@ -165,6 +208,10 @@ class LookupModule:
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         model_name, world_size = key.model_name, key.world_size
+        owned_session = (
+            self._ctx.session_manager.get_or_create(key.request_id)
+            if self._ctx.storage_manager.supports_owned_reads() else None
+        )
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_START,
@@ -201,6 +248,7 @@ class LookupModule:
                     model_name=model_name,
                     cache_salt=key.cache_salt,
                     early_exit_reason="no_gpu_context",
+                    owned_session=owned_session,
                 )
             )
             return
@@ -225,6 +273,7 @@ class LookupModule:
                     model_name=model_name,
                     cache_salt=key.cache_salt,
                     early_exit_reason="empty_chunk_hashes",
+                    owned_session=owned_session,
                 )
             )
             return
@@ -261,7 +310,10 @@ class LookupModule:
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
+        session = (
+            owned_session if owned_session is not None
+            else self._ctx.session_manager.get_or_create(key.request_id)
+        )
         self._cancel_owned_session(session)
         session.set_tokens(list(key.token_ids))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
@@ -299,17 +351,23 @@ class LookupModule:
                     model_name=model_name,
                     cache_salt=key.cache_salt,
                     early_exit_reason="no_group_layout_descs",
+                    owned_session=owned_session,
                 )
             )
             return
 
         with session.owned_reservation_scope(read_owner):
+            deadline = (
+                self._ctx.session_manager.read_lease_deadline(session)
+                if read_owner is not None else None
+            )
             handle = self._ctx.storage_manager.submit_prefetch_task(
                 PrefetchRequestSpec(
                     keys=obj_keys,
                     group_layout_descs=group_layout_descs,
                     num_kv_readers=num_kv_readers,
                     attn_desc=attn_desc,
+                    read_lease_deadline=deadline,
                 ),
                 external_request_id=key.request_id,
                 read_owner=read_owner,
@@ -320,6 +378,7 @@ class LookupModule:
                 world_size=key.world_size,
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
+                owned_session=owned_session,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
                 model_name=model_name,
@@ -382,64 +441,7 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if found is None:
-            return None
-
-        stride = job.attn_desc.num_object_groups * job.world_size
-        num_chunks = job.handle.total_requested_keys // stride
-        found_count, _retain = fold_unfold_ranked(
-            found,
-            num_chunks,
-            job.world_size,
-            job.attn_desc.num_chunks_in_sw,
-        )
-
-        # Record the model-wide hit length on the session so a later
-        # free_lookup_locks can reconstruct which keys the prefetch
-        # read-locked (see ``unfold``: full-attention groups lock the whole
-        # hit prefix, sliding-window groups only its in-window suffix).
-        session = self._ctx.session_manager.get_or_create(job.request_id)
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-        )
-
-        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
-        # object group's window rule, so L2's contribution is however much
-        # further ``found_count`` reaches -- not a count of L1-resident keys.
-        l1_chunks = job.handle.l1_hit_chunks
-        if l1_chunks > found_count:
-            logger.error(
-                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
-                l1_chunks,
-                found_count,
-                request_id,
-            )
-            l1_chunks = found_count
-        l2_chunks = found_count - l1_chunks
-
-        self._ctx.event_bus.publish(
-            Event(
-                event_type=EventType.MP_LOOKUP_PREFETCH_END,
-                session_id=job.request_id,
-                metadata={
-                    "found_count": found_count,
-                    "requested_tokens": job.requested_tokens,
-                    "hit_tokens": found_count * self._ctx.chunk_size,
-                    "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
-                    "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
-                    "early_exit_reason": job.early_exit_reason,
-                    "model_name": job.model_name,
-                    "cache_salt": job.cache_salt,
-                },
-            )
-        )
-
-        with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(request_id, None)
-
-        return found_count
+        return self._query_prefetch_job(job)
 
     def wait_prefetch_status(
         self,
@@ -472,7 +474,7 @@ class LookupModule:
 
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
-        return self.query_prefetch_status(request_id)
+        return self._query_prefetch_job(job)
 
     def free_lookup_locks(
         self,
@@ -623,8 +625,100 @@ class LookupModule:
                 obj_keys.extend(group_keys[lo:hi])
         return obj_keys
 
+    def _query_prefetch_job(self, job: _PrefetchJob) -> int | None:
+        """Consume only this captured job; a late owned result cannot revive it."""
+        request_id = job.request_id
+        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
+        if found is None:
+            return None
+
+        stride = job.attn_desc.num_object_groups * job.world_size
+        num_chunks = job.handle.total_requested_keys // stride
+        found_count, _retain = fold_unfold_ranked(
+            found,
+            num_chunks,
+            job.world_size,
+            job.attn_desc.num_chunks_in_sw,
+        )
+
+        # Record the model-wide hit length on the session so a later
+        # free_lookup_locks can reconstruct which keys the prefetch
+        # read-locked (see ``unfold``: full-attention groups lock the whole
+        # hit prefix, sliding-window groups only its in-window suffix).
+        if job.owned_session is not None:
+            # END removes the session before notifying listeners. Claiming the
+            # same job under this lock linearizes publication against its cleanup.
+            with self._prefetch_job_lock:
+                if (
+                    self._prefetch_jobs.get(job.request_id) is not job
+                    or self._ctx.session_manager.get(job.request_id)
+                    is not job.owned_session
+                ):
+                    return 0
+                job.owned_session.record_prefetch_result(
+                    found_count, tuple(range(job.attn_desc.num_object_groups))
+                )
+                self._prefetch_jobs.pop(job.request_id)
+        else:
+            session = self._ctx.session_manager.get_or_create(job.request_id)
+            session.record_prefetch_result(
+                found_count, tuple(range(job.attn_desc.num_object_groups))
+            )
+
+        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
+        # object group's window rule, so L2's contribution is however much
+        # further ``found_count`` reaches -- not a count of L1-resident keys.
+        l1_chunks = job.handle.l1_hit_chunks
+        if l1_chunks > found_count:
+            logger.error(
+                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
+                l1_chunks,
+                found_count,
+                request_id,
+            )
+            l1_chunks = found_count
+        l2_chunks = found_count - l1_chunks
+
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                session_id=job.request_id,
+                metadata={
+                    "found_count": found_count,
+                    "requested_tokens": job.requested_tokens,
+                    "hit_tokens": found_count * self._ctx.chunk_size,
+                    "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
+                    "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
+                    "early_exit_reason": job.early_exit_reason,
+                    "model_name": job.model_name,
+                    "cache_salt": job.cache_salt,
+                },
+            )
+        )
+
+        if job.owned_session is None:
+            with self._prefetch_job_lock:
+                if self._prefetch_jobs.get(job.request_id) is job:
+                    self._prefetch_jobs.pop(job.request_id)
+
+        return found_count
+
+    def _destroy_owned_session(self, session: Session) -> None:
+        """Retire only this owned L1 job, then cancel its unused reader shares."""
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(session.request_id)
+            if job is not None and job.owned_session is session:
+                self._prefetch_jobs.pop(session.request_id)
+        self._cancel_owned_session(session, final=True)
+
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
+            if (
+                job.owned_session is not None
+                and self._ctx.session_manager.get(job.request_id)
+                is not job.owned_session
+            ):
+                return
             self._prefetch_jobs[job.request_id] = job
 
     def _active_prefetch_count(self) -> int:

@@ -1094,3 +1094,230 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     assert adapter._reregister_kv_caches_callback() is ring_ok
+
+
+def test_abort_during_pending_retrieve_does_not_report_store(fake_adapter) -> None:
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(name="retrieve_future")
+    retrieve_future.query.return_value = False
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+
+def test_abort_when_retrieve_finishes_reports_only_retrieve(fake_adapter) -> None:
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(name="retrieve_future")
+    retrieve_future.query.return_value = True
+    retrieve_future.result.return_value = True
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == {"req-1"}
+
+
+def test_abort_after_retrieve_completion_does_not_report_store(fake_adapter) -> None:
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(name="retrieve_future")
+    retrieve_future.query.return_value = True
+    retrieve_future.result.return_value = True
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+
+    finished_stores, finished_retrieves = adapter.get_finished(set())
+    assert finished_stores == set()
+    assert finished_retrieves == {"req-1"}
+
+    adapter.mark_aborted_retrieves({"req-1"})
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+
+def test_unhealthy_worker_preserves_aborted_retrieve_suppression(
+    fake_adapter,
+) -> None:
+    adapter, _send_mock, _future = fake_adapter
+    adapter.mark_aborted_retrieves({"req-1"})
+    adapter._health_event.clear()
+
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+    adapter._health_event.set()
+    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+@pytest.mark.parametrize("retrieve_result", [True, False])
+def test_cancel_marker_deduplicates_terminal_receive_across_steps(
+    fake_adapter, healthy, retrieve_result
+):
+    """A cancelled load reports recv once, never a fictitious store completion."""
+    adapter, _, _ = fake_adapter
+    future = MagicMock()
+    future.query.return_value = True
+    future.result.return_value = retrieve_result
+    adapter.retrieve_futures["cancelled"] = (future, [7])
+    adapter.mark_aborted_retrieves({"cancelled"})
+    if not healthy:
+        adapter._health_event.clear()
+    sending, receiving = adapter.get_finished({"cancelled"})
+    assert sending == set()
+    assert receiving == {"cancelled"}
+    adapter._health_event.set()
+    for _ in range(3):
+        sending, receiving = adapter.get_finished({"cancelled"})
+        assert sending == set()
+        assert receiving == set()
+    errors = adapter.get_block_ids_with_load_errors()
+    assert errors == ({7} if not healthy or not retrieve_result else set())
+    assert adapter.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("retrieve_result", [True, False])
+def test_cancelled_pending_receive_settles_on_later_step(fake_adapter, retrieve_result):
+    """Pending load ownership survives abort until the late result is consumed."""
+    adapter, _, _ = fake_adapter
+    future = MagicMock()
+    future.query.return_value = False
+    future.result.return_value = retrieve_result
+    adapter.retrieve_futures["cancelled"] = (future, [7])
+    adapter.mark_aborted_retrieves({"cancelled"})
+    assert adapter.get_finished({"cancelled"}) == (set(), set())
+    future.query.return_value = True
+    assert adapter.get_finished(set()) == (set(), {"cancelled"})
+    assert adapter.get_finished({"cancelled"}) == (set(), set())
+    errors = adapter.get_block_ids_with_load_errors()
+    assert errors == (set() if retrieve_result else {7})
+
+
+
+def test_registration_starts_heartbeat_before_any_cache_traffic(fake_adapter) -> None:
+    """A successfully registered idle worker must already be sending heartbeats."""
+    adapter, req_client, _ = fake_adapter
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    req_client.register_kv_cache.assert_called_once()
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    assert heartbeat.instance_id == adapter.instance_id
+    assert heartbeat.calls == ["register_recover_callback", "start"]
+    adapter.submit_store_request("first-request", _op([[0]]), MagicMock())
+    assert len(FakeHeartbeatThread.instances) == 1
+
+
+def test_failed_registration_does_not_start_heartbeat(fake_adapter) -> None:
+    """A rejected registration must not publish a live worker heartbeat."""
+    adapter, _req_client, future = fake_adapter
+    future.result.side_effect = TimeoutError("server down")
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    with pytest.raises(ConnectionError):
+        adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert FakeHeartbeatThread.instances == []
+
+
+def test_registered_idle_shutdown_stops_heartbeat_before_unregister(fake_adapter) -> None:
+    """Shutdown ordering also holds when no cache request was ever submitted."""
+    adapter, req_client, future = fake_adapter
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    assert len(FakeHeartbeatThread.instances) == 1
+    heartbeat = FakeHeartbeatThread.instances[0]
+    stopped_at_unregister: list[bool] = []
+
+    def unregister(instance_id: int) -> MagicMock:
+        assert instance_id == adapter.instance_id
+        stopped_at_unregister.append(heartbeat.stop_requested)
+        return future
+
+    req_client.unregister_kv_cache.side_effect = unregister
+    adapter.shutdown()
+    assert stopped_at_unregister == [True]
+
+
+def test_idle_registration_survives_server_reaper_without_cache_traffic(
+    fake_adapter: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real heartbeat/PING/reaper with a virtual clock; CUDA registration is stubbed."""
+    # First Party
+    from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as gpu_mod
+    from lmcache.v1.multiprocess.modules.management import ManagementModule
+
+    adapter, _req_client, _future = fake_adapter
+    now = [1000.0]
+    monkeypatch.setattr(gpu_mod, "time", MagicMock(monotonic=lambda: now[0]))
+    target = gpu_mod.LMCacheDrivenTransferModule.__new__(
+        gpu_mod.LMCacheDrivenTransferModule
+    )
+    target._ctx = MagicMock()
+    target._cache_contexts = {}
+    target._lock = threading.Lock()
+    manager = ManagementModule(MagicMock(), liveness_targets=[target])
+    contexts: list[MagicMock] = []
+
+    # Stubbing CUDA IPC is necessary; liveness and reaping use the real module.
+    def register(*args: object, **kwargs: object) -> None:
+        target._cache_contexts[adapter.instance_id] = gpu_mod.ContextEntry(
+            MagicMock(), "test-model", 1, now[0], False
+        )
+
+    def create(kv_caches: dict, mode: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.register.side_effect = register
+        contexts.append(ctx)
+        return ctx
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", create)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", HeartbeatThread)
+    monkeypatch.setattr(HeartbeatThread, "start", lambda self: self._execute())
+    monkeypatch.setattr(HeartbeatThread, "stop", lambda self, **kw: None)
+    monkeypatch.setattr(
+        adapter_mod, "send_ping",
+        lambda req_client, timeout, instance_id=None: manager.ping(instance_id),
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    assert target.tracked_instance_count() == 1
+    assert adapter._heartbeat is not None
+
+    # Exceed the production 3600 s grace without Store or Retrieve, in CPU time.
+    for _ in range(361):
+        now[0] += 10.0
+        adapter._heartbeat._execute()
+        assert target.reap_stale_instances(120.0, 3600.0) == []
+    assert target.tracked_instance_count() == 1
+    assert len(contexts) == 1  # No unnecessary re-registration.
+
+    # The reaper still releases genuinely silent registrations.
+    now[0] += 121.0
+    assert target.reap_stale_instances(120.0, 3600.0) == [adapter.instance_id]

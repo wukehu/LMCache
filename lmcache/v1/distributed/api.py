@@ -445,6 +445,12 @@ class PrefetchRequestSpec:
         default=None, compare=False, repr=False
     )
     """In-process physical attribution only; omitted from IPC/trace codecs."""
+    read_lease_deadline: float | None = field(default=None, compare=False, repr=False)
+    """Server-local monotonic deadline for an authenticated pending L1 reader.
+
+    None retains the ordinary read TTL. This is not a wire timestamp and is
+    valid only with owned L1 lookup; the Session manager supplies its bound.
+    """
 
     def __post_init__(self) -> None:
         if self.num_kv_readers < 1:

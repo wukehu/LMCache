@@ -6,6 +6,7 @@ Managing objects and memory for L1 cache
 # Standard
 from dataclasses import dataclass, field
 from typing import Hashable, Literal
+import math
 import threading
 import time
 
@@ -252,6 +253,16 @@ class L1Manager:
                 "L1 used/total ratio (0.0–1.0)",
                 lambda: _l1_usage_ratio_or_zero(L1Manager._gauge_target),
             )
+            register_gauge(
+                "lmcache.l1_manager",
+                "lmcache_mp.l1_capacity_bytes",
+                "Effective allocator capacity in bytes, including an empty L1 pool",
+                lambda: (
+                    L1Manager._gauge_target.get_memory_usage()[1]
+                    if L1Manager._gauge_target is not None
+                    else []
+                ),
+            )
 
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
@@ -320,7 +331,8 @@ class L1Manager:
 
     @l1_mgr_synchronized
     def reserve_owned_read(
-        self, keys: list[ObjectKey], owner: Hashable, read_locks: int
+        self, keys: list[ObjectKey], owner: Hashable, read_locks: int,
+        *, lease_deadline: float | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Reserve committed resident objects for one unique lookup generation.
 
@@ -333,7 +345,12 @@ class L1Manager:
         if len(set(keys)) != len(keys):
             raise ValueError("duplicate keys in owned reservation")
         result: dict[ObjectKey, L1OperationResult] = {}
-        deadline = time.monotonic() + self._read_ttl_seconds
+        now = time.monotonic()
+        if lease_deadline is not None and (
+            not math.isfinite(lease_deadline) or lease_deadline <= now
+        ):
+            raise ValueError("owned read lease deadline must be finite and future")
+        deadline = now + self._read_ttl_seconds if lease_deadline is None else lease_deadline
         for key in keys:
             entry = self._objects.get(key)
             if entry is None:
@@ -356,6 +373,24 @@ class L1Manager:
             Event(event_type=EventType.L1_READ_RESERVED, metadata={"keys": successful})
         )
         return result
+
+    @l1_mgr_synchronized
+    def renew_owned_read(
+        self, keys: list[ObjectKey], owner: Hashable, deadline: float
+    ) -> int:
+        """Extend only this owner's resident reservations under the L1 mutex.
+
+        Missing/replaced allocations and cancelled/completed owners cannot be
+        recreated. Reader counts and active completion receipts do not change.
+        """
+        if not math.isfinite(deadline) or deadline <= time.monotonic():
+            raise ValueError("owned read lease deadline must be finite and future")
+        renewed = 0
+        for key in set(keys):
+            entry = self._objects.get(key)
+            if entry is not None and entry.committed:
+                renewed += entry.read_leases.renew(owner, deadline)
+        return renewed
 
     @l1_mgr_synchronized
     def acquire_owned_read(

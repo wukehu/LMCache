@@ -38,6 +38,7 @@ from lmcache.v1.distributed.read_completion import ReadCompletionRegistry
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
+from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import is_fs_object_filename
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigurableAdapter,
     L2ReconfigureError,
@@ -66,6 +67,7 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.fs_inventory import InventorySampler
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.mp_observability.source_attribution import (
     Source,
@@ -219,6 +221,36 @@ class StorageManager:
             ),
             self.get_l2_usages,
         )
+        for name, field in (
+            ("lmcache_mp.l2_adapter_capacity_bytes", "capacity"),
+            ("lmcache_mp.l2_adapter_usage_bytes", "usage"),
+        ):
+            register_gauge(
+                "lmcache.l2",
+                name,
+                "Per-adapter quota or tracked bytes; zero quota is unknown/unlimited",
+                lambda field=field: self.get_l2_capacity_observations(field),
+            )
+        for field in ("capacity", "used", "available"):
+            register_gauge(
+                "lmcache.l2",
+                f"lmcache_mp.fs_filesystem_{field}_bytes",
+                "Backing filesystem bytes, including other users; not cache quota",
+                lambda field=field: self.get_fs_capacity_observations(field),
+            )
+        self._fs_inventory = InventorySampler(
+            self.get_fs_inventory_targets, is_fs_object_filename,
+        )
+        for field in (
+            "objects", "logical_bytes", "allocated_bytes", "completed_at",
+            "duration_seconds", "success",
+        ):
+            register_gauge(
+                "lmcache.l2", f"lmcache_mp.fs_inventory_{field}",
+                "Read-only FS inventory; last complete sampled pass, not cache quota",
+                lambda field=field: self.get_fs_inventory_observations(field),
+            )
+        self._fs_inventory.start()
 
     # External APIs for serving engine integration code to call
     def supports_owned_reads(self) -> bool:
@@ -228,6 +260,12 @@ class StorageManager:
     def cancel_owned_read(self, keys: list[ObjectKey], owner: str) -> None:
         """Cancel lookup reservations, retaining any GPU copies already in flight."""
         self._l1_manager.cancel_owned_read(keys, owner)
+
+    def renew_owned_read(self, keys: list[ObjectKey], owner: str, deadline: float) -> int:
+        """Keep authenticated pending L1 reads resident without changing counts."""
+        if not self.supports_owned_reads():
+            raise ValueError("owned read renewal requires an L1-only storage manager")
+        return self._l1_manager.renew_owned_read(keys, owner, deadline)
 
     def abandon_owned_read(self, keys: list[ObjectKey], owner: str, reader: int) -> None:
         """Release only one failed worker's unused lookup slots."""
@@ -532,6 +570,10 @@ class StorageManager:
         keys = spec.keys
         if read_owner is not None and not self.supports_owned_reads():
             raise ValueError("owned lookup requires an L1-only storage manager")
+        if spec.read_lease_deadline is not None and (
+            read_owner is None or spec.mode is not PrefetchMode.LOOKUP
+        ):
+            raise ValueError("read lease deadline requires an owned L1 lookup")
 
         if spec.mode is PrefetchMode.WARM:
             # Warm path: load all keys, lock none. skip_l2 makes it a no-op.
@@ -562,7 +604,8 @@ class StorageManager:
             )
         else:
             l1_read_result = self._l1_manager.reserve_owned_read(
-                keys, read_owner, spec.num_kv_readers
+                keys, read_owner, spec.num_kv_readers,
+                lease_deadline=spec.read_lease_deadline,
             )
 
         spec.source_ledger.resident(
@@ -948,6 +991,128 @@ class StorageManager:
             for usage in usages
         ]
 
+    def get_l2_capacity_observations(
+        self, field: str,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Return effective quota or tracked bytes, preserving adapter identity.
+
+        Args:
+            field: ``capacity`` for quota bytes or ``usage`` for tracked bytes.
+
+        Returns:
+            Observations labelled by adapter ID and backend. A zero capacity
+            means unknown or unlimited, never a zero-sized cache. Failed reads
+            are absent rather than reported as zero.
+        """
+        if field not in ("capacity", "usage"):
+            raise ValueError("field must be capacity or usage")
+        observations = []
+        for adapter_id, descriptor, adapter in self._snapshot_adapters():
+            try:
+                usage = adapter.get_usage()
+                capacity = int(usage.total_capacity_bytes)
+                used = int(usage.total_bytes_used)
+                if capacity < 0 or used < 0:
+                    continue
+            except Exception:
+                continue
+            value = capacity if field == "capacity" else used
+            observations.append((int(value), {
+                "adapter_id": str(adapter_id),
+                "l2_name": descriptor.type_name,
+                "quota_limited": str(capacity > 0).lower(),
+            }))
+        return observations
+
+    def get_fs_inventory_targets(self) -> dict[str, str]:
+        """Return actual FS adapter paths for background read-only sampling.
+
+        A failed adapter status invalidates this refresh; cached measurements
+        are retained with success false by the sampler, never replaced by zero.
+        """
+        result = {}
+        for adapter_id, descriptor, adapter in self._snapshot_adapters():
+            if descriptor.type_name == "fs":
+                path = adapter.report_status().get("base_path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("FS adapter has no effective base_path")
+                result[str(adapter_id)] = path
+        return result
+
+    def get_fs_inventory_observations(
+        self, field: str,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Read cached inventory, omitting unknown bytes and absent snapshots.
+
+        ``success`` describes the latest attempt. Other values describe the
+        last complete pass; ``completed_at`` allows consumers to check age.
+        No filesystem traversal occurs in this scrape callback.
+        """
+        if field not in (
+            "objects", "logical_bytes", "allocated_bytes", "completed_at",
+            "duration_seconds", "success",
+        ):
+            raise ValueError("unsupported inventory field")
+        observations = []
+        for adapter_id, (snapshot, success) in self._fs_inventory.read().items():
+            value = int(success) if field == "success" else (
+                getattr(snapshot, field) if snapshot is not None else None
+            )
+            if value is not None:
+                observations.append((value, {
+                    "adapter_id": adapter_id, "l2_name": "fs",
+                }))
+        return observations
+
+    def get_fs_capacity_observations(
+        self, field: str,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Observe the filesystem containing each effective FS adapter path.
+
+        Args:
+            field: ``capacity``, ``used`` (includes other users), or
+                ``available`` (excludes space reserved from this process).
+
+        Returns:
+            Per-adapter byte observations. Shared mounts must not be summed
+            across adapters or Pods. These are filesystem statistics, not
+            cache-directory sizes, PVC limits, or an enforced cache quota.
+            Non-FS adapters and unavailable observations are omitted.
+
+        Raises:
+            ValueError: If the field is unsupported.
+        """
+        if field not in ("capacity", "used", "available"):
+            raise ValueError("field must be capacity, used, or available")
+        observations = []
+        for adapter_id, descriptor, adapter in self._snapshot_adapters():
+            if descriptor.type_name != "fs":
+                continue
+            try:
+                status = adapter.report_status()
+                path = status.get("base_path")
+                if not isinstance(path, str) or not path:
+                    continue
+                stat = os.statvfs(path)
+                if not (
+                    stat.f_frsize > 0
+                    and 0 <= stat.f_bavail <= stat.f_bfree <= stat.f_blocks
+                ):
+                    continue
+                values = {
+                    "capacity": stat.f_blocks * stat.f_frsize,
+                    "used": (stat.f_blocks - stat.f_bfree) * stat.f_frsize,
+                    "available": stat.f_bavail * stat.f_frsize,
+                }
+                observations.append((int(values[field]), {
+                    "adapter_id": str(adapter_id),
+                    "l2_name": descriptor.type_name,
+                }))
+            except Exception:
+                # An unavailable mount must not appear as an empty cache.
+                continue
+        return observations
+
     def get_l2_usages_by_type(self) -> dict[str, list[AdapterUsage]]:
         """Per-adapter usage snapshots grouped by adapter type name.
 
@@ -1246,6 +1411,8 @@ class StorageManager:
         """
         Close the storage manager and release all resources.
         """
+        if not self._fs_inventory.close():
+            logger.warning("FS inventory worker still blocked in filesystem syscall")
         self._prefetch_controller.stop()
         self._store_controller.stop()
         self._eviction_controller.stop()

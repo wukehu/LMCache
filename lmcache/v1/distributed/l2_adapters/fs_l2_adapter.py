@@ -164,6 +164,16 @@ def _filename_to_object_key(
         return None
 
 
+def is_fs_object_filename(filename: str) -> bool:
+    """Return whether a filename encodes a committed FS ObjectKey.
+
+    This validates names only, not file contents or KV integrity. It exposes
+    the adapter's existing parser for read-only inventory without duplicating
+    its salted/unsalted naming contract.
+    """
+    return _filename_to_object_key(filename) is not None
+
+
 class FSL2AdapterConfig(L2AdapterConfigBase):
     """
     Config for the filesystem-backed L2 adapter.
