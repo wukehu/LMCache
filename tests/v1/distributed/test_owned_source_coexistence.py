@@ -13,11 +13,67 @@ import torch
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey, PrefetchRequestSpec
 from lmcache.v1.distributed.config import (
-    EvictionConfig, L1ManagerConfig, L1MemoryManagerConfig, StorageManagerConfig,
+    EvictionConfig,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
 )
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
-from lmcache.v1.mp_observability.source_attribution import SourceMetrics
+from lmcache.v1.mp_observability.source_attribution import (
+    SourceMetrics,
+    TokenConsumptionLedger,
+    merge_token_sources,
+    source_token_attribution_enabled,
+)
+
+
+@pytest.mark.parametrize("ranks", [1, 2, 16])
+def test_logical_source_tokens_do_not_multiply_with_tp(ranks):
+    spans = merge_token_sources(
+        [[(0, 256, "local_cpu"), (256, 512, "remote_store")]] * ranks, 17, 511
+    )
+    ledger = TokenConsumptionLedger(spans, 17, 511)
+    assert ledger.consumed(511) == {}  # Lookup alone cannot prove a load.
+    assert ledger.loaded() == {"local_cpu": 239, "remote_store": 255}
+    assert ledger.loaded() == {}
+    assert ledger.consumed(256) == {"local_cpu": 239}
+    assert ledger.consumed(512) == {"remote_store": 255}
+    assert ledger.consumed(1024) == {}
+
+
+def test_source_intersection_handles_mixed_missing_and_overlapping_shards():
+    assert merge_token_sources(
+        [
+            [(0, 256, "local_cpu"), (256, 512, "local_disk")],
+            [(0, 256, "remote_store"), (256, 384, "local_disk")],
+        ],
+        0,
+        512,
+    ) == [(0, 256, "mixed"), (256, 384, "local_disk"), (384, 512, "unknown")]
+    assert merge_token_sources(
+        [[(0, 256, "local_cpu"), (128, 256, "local_cpu")]], 0, 256
+    ) == [(0, 128, "local_cpu"), (128, 256, "unknown")]
+    assert merge_token_sources([[(0, 256, "local_cpu")], []], 0, 256) == [
+        (0, 256, "unknown")
+    ]
+
+
+@pytest.mark.parametrize("loaded_first", [False, True])
+def test_invalidated_allocation_ignores_late_load_and_model_callbacks(loaded_first):
+    ledger = TokenConsumptionLedger([(0, 512, "local_disk")], 16, 511)
+    if loaded_first:
+        assert ledger.loaded() == {"local_disk": 495}
+    ledger.invalidate()
+    assert ledger.loaded() == {}
+    assert ledger.consumed(512) == {}
+
+
+@pytest.mark.parametrize("flag", [None, False, "false", "0"])
+def test_source_token_switch_is_opt_in(flag):
+    assert not source_token_attribution_enabled(
+        {"lmcache.mp.source_token_attribution": flag}
+    )
 
 
 @pytest.mark.parametrize("owned", [False, True])
@@ -31,18 +87,25 @@ def test_source_accounting_and_resident_read(monkeypatch, owned):
     monkeypatch.setattr(
         "lmcache.v1.distributed.storage_manager.SourceMetrics", lambda: metric_sink
     )
-    manager = StorageManager(StorageManagerConfig(
-        l1_manager_config=L1ManagerConfig(
-            memory_config=L1MemoryManagerConfig(
-                size_in_bytes=16 << 20, use_lazy=False, shm_name=""
-            ), read_ttl_seconds=1,
-        ),
-        l2_adapter_config=L2AdaptersConfig(adapters=[]),
-        eviction_config=EvictionConfig(eviction_policy="LRU"),
-    ))
+    manager = StorageManager(
+        StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=16 << 20, use_lazy=False, shm_name=""
+                ),
+                read_ttl_seconds=1,
+            ),
+            l2_adapter_config=L2AdaptersConfig(adapters=[]),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+        )
+    )
     try:
-        keys = [ObjectKey(chunk_hash=i.to_bytes(8, "big"),
-                          model_name="owned-source", kv_rank=0) for i in range(2)]
+        keys = [
+            ObjectKey(
+                chunk_hash=i.to_bytes(8, "big"), model_name="owned-source", kv_rank=0
+            )
+            for i in range(2)
+        ]
         layout = MemoryLayoutDesc(shapes=[torch.Size([2048])], dtypes=[torch.int32])
         allocated = manager.reserve_write(keys, layout, mode="new")
         assert len(allocated) == 2

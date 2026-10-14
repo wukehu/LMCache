@@ -133,6 +133,20 @@ class ZmqMultiprocessClient(RequestClient):
         """Start an opt-in lookup with a scheduler incarnation credential."""
         return self._call(RequestType.LOOKUP_LEASED, key, tp_size, credential)
 
+    def lookup_with_source(
+        self, key: Any, tp_size: int, attempt: str, credential: str
+    ) -> MessagingFuture[Any]:
+        """Start a versioned provenance lookup, optionally with an owned lease."""
+        return self._call(
+            RequestType.LOOKUP_WITH_SOURCE, key, tp_size, attempt, credential
+        )
+
+    def query_prefetch_source_status(
+        self, request_id: str, attempt: str
+    ) -> MessagingFuture[Any]:
+        """Poll origins only for the matching lookup attempt."""
+        return self._call(RequestType.QUERY_PREFETCH_SOURCE_STATUS, request_id, attempt)
+
     def renew_sessions(
         self, credentials: list[tuple[str, str]]
     ) -> MessagingFuture[Any]:

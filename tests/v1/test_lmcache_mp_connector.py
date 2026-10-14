@@ -21,7 +21,10 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
     LMCacheMPConnectorMetadata,
     LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
+    LMCacheSourceTokenPromMetrics,
+    LMCacheSourceTokenStats,
 )
+from lmcache.v1.mp_observability.source_attribution import TokenConsumptionLedger
 
 
 def _make_scheduler_connector(
@@ -37,6 +40,61 @@ def _make_scheduler_connector(
     connector._group_tokens_per_block = [16]
     connector.lazy_offload = False
     return connector, tracker
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_source_tokens_separate_successful_load_from_engine_use(failed):
+    connector, tracker = _make_scheduler_connector(LMCacheMPRequestState.LOADING)
+    connector._source_tokens_enabled = True
+    connector._source_token_stats = LMCacheSourceTokenStats()
+    tracker.allocated_block_ids = {0: [0, 1, 2]}
+    spans = [(0, 256, "local_cpu"), (256, 512, "remote_store")]
+    tracker.source_tokens = TokenConsumptionLedger(spans, 16, 511)
+    tracker.source_loaded_tokens = TokenConsumptionLedger(spans, 16, 512)
+    connector.on_model_step_completed("req", 511)
+    assert connector.get_kv_connector_stats() is None
+    output = KVConnectorOutput(
+        finished_recving={"req"}, invalid_block_ids={1} if failed else set()
+    )
+    connector.update_connector_output(output)
+    connector.update_connector_output(output)
+    connector.on_model_step_completed("req", 511)
+    connector.on_model_step_completed("req", 1024)
+    stats = connector.get_kv_connector_stats()
+    if failed:
+        assert stats is None
+    else:
+        assert stats.data == {
+            "loaded": {"local_cpu": 240, "remote_store": 256},
+            "reused": {"local_cpu": 240, "remote_store": 255},
+        }
+    assert connector.get_kv_connector_stats() is None
+    connector._cleanup_request_tracker("req")
+    connector.on_model_step_completed("req", 1024)
+    assert connector.get_kv_connector_stats() is None
+
+
+def test_source_stats_prometheus_and_multi_interval_aggregation():
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+    registry = CollectorRegistry()
+
+    def counter(**kwargs):
+        return Counter(registry=registry, **kwargs)
+
+    metrics = LMCacheSourceTokenPromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {Counter: counter, Gauge: Gauge, Histogram: Histogram},
+        ["model_name", "engine"],
+        {0: ["m", "0"]},
+    )
+    a = LMCacheSourceTokenStats({"loaded": {"local_cpu": 512}})
+    b = LMCacheSourceTokenStats({"reused": {"local_cpu": 511}})
+    metrics.observe(a.aggregate(b).data)
+    labels = {"model_name": "m", "engine": "0", "source": "local_cpu"}
+    assert registry.get_sample_value("vllm:lmcache_loaded_tokens_total", labels) == 512
+    assert registry.get_sample_value("vllm:lmcache_reused_tokens_total", labels) == 511
+    assert a.data == {"loaded": {"local_cpu": 512}}
 
 
 def test_retrieve_metadata_keeps_request_loading_until_completion() -> None:

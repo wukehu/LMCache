@@ -22,6 +22,11 @@ from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.mp_observability.source_attribution import (
+    SourceSpan,
+    merge_token_sources,
+    source_token_attribution_enabled,
+)
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
@@ -672,6 +677,9 @@ class LMCacheMPSchedulerAdapter:
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
         self._mq_timeout = mq_timeout
+        self._source_tokens = source_token_attribution_enabled(extra_config)
+        self._source_attempts: dict[str, str] = {}
+        self._source_spans: dict[str, dict[str, list[SourceSpan]]] = {}
 
         # Lookup state tracking:
         # - _pending_lookups: request_ids submitted but not yet resolved
@@ -810,8 +818,10 @@ class LMCacheMPSchedulerAdapter:
         try:
             for offset in range(0, len(credentials), 256):
                 batch = credentials[offset : offset + 256]
-                accepted = self.req_clients[url].renew_sessions(batch).result(
-                    timeout=self._heartbeat_interval
+                accepted = (
+                    self.req_clients[url]
+                    .renew_sessions(batch)
+                    .result(timeout=self._heartbeat_interval)
                 )
                 missing = {request_id for request_id, _ in batch} - set(accepted)
                 # Remove IDs that completed while this round trip was running.
@@ -821,7 +831,8 @@ class LMCacheMPSchedulerAdapter:
                     logger.error(
                         "Session renewal rejected server=%s request_ids=%s; "
                         "lookup ownership cannot be revived",
-                        url, sorted(missing),
+                        url,
+                        sorted(missing),
                     )
             return True
         except Exception:
@@ -884,21 +895,34 @@ class LMCacheMPSchedulerAdapter:
             request_configs=request_configs,
         ).no_worker_id_version()
 
+        credential = ""
+        if self._source_tokens:
+            self._source_attempts[request_id] = uuid.uuid4().hex
         if self._leased_lookup:
             with self._session_lease_lock:
                 existing = self._session_leases.get(request_id)
                 credential = existing[0] if existing is not None else uuid.uuid4().hex
+        if self._source_tokens:
+            futures = {
+                url: self.req_clients[url].lookup_with_source(
+                    key, self.tp_size, self._source_attempts[request_id], credential
+                )
+                for url in self._server_urls
+            }
+        elif self._leased_lookup:
             futures = {
                 url: self.req_clients[url].lookup_leased(key, self.tp_size, credential)
                 for url in self._server_urls
             }
-            with self._session_lease_lock:
-                self._session_leases[request_id] = (credential, futures)
         else:
             futures = {
                 url: self.req_clients[url].lookup(key, self.tp_size)
                 for url in self._server_urls
             }
+
+        if self._leased_lookup:
+            with self._session_lease_lock:
+                self._session_leases[request_id] = (credential, futures)
 
         # Do not wait for the acknowledgement here: that is a full server
         # round trip on the scheduler thread. check_lookup_result resolves
@@ -994,9 +1018,15 @@ class LMCacheMPSchedulerAdapter:
             # pool and may be reordered, and a status query for an unknown
             # request_id answers 0: a spurious miss whose prefetch locks are
             # never released. So never query until every server has acked.
-            ack.futures = {
-                url: fut for url, fut in ack.futures.items() if not fut.query()
-            }
+            for url, fut in list(ack.futures.items()):
+                if not fut.query():
+                    continue
+                if self._source_tokens:
+                    # Versioned opt-in RPC; an old peer must never supply fake origins.
+                    if fut.result(timeout=0) != "source_tokens_v1":
+                        self._mark_lookup_timed_out(url)
+                        return 0
+                del ack.futures[url]
             if ack.futures:
                 if time.monotonic() - ack.submitted_at >= self._mq_timeout:
                     for url in ack.futures:
@@ -1018,7 +1048,11 @@ class LMCacheMPSchedulerAdapter:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
                 futures[url] = (
-                    self.req_clients[url].query_prefetch_status(request_id),
+                    self.req_clients[url].query_prefetch_source_status(
+                        request_id, self._source_attempts[request_id]
+                    )
+                    if self._source_tokens
+                    else self.req_clients[url].query_prefetch_status(request_id),
                     time.monotonic(),
                 )
 
@@ -1042,6 +1076,9 @@ class LMCacheMPSchedulerAdapter:
                 return 0
             if r is None:
                 continue
+            if self._source_tokens:
+                r, spans = r
+                self._source_spans.setdefault(request_id, {})[url] = spans
             per_server[url] = int(r)
 
         if len(per_server) < len(self._server_urls):
@@ -1063,6 +1100,14 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results[request_id] = token_count
         return token_count
 
+    def get_lookup_source_spans(self, request_id: str) -> list[SourceSpan]:
+        """Return all-server logical provenance before lookup cleanup."""
+        end = self._finished_lookup_results.get(request_id, 0)
+        per_server = self._source_spans.get(request_id, {})
+        return merge_token_sources(
+            [per_server.get(url, []) for url in self._server_urls], 0, end
+        )
+
     def num_blocks_per_chunk(self) -> int:
         """
         Returns:
@@ -1082,6 +1127,8 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._source_attempts.pop(request_id, None)
+        self._source_spans.pop(request_id, None)
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""

@@ -50,6 +50,8 @@ REQUEST_NAMES = [
     "COMMIT_RETRIEVE",
     "LOOKUP_LEASED",
     "RENEW_SESSIONS",
+    "LOOKUP_WITH_SOURCE",
+    "QUERY_PREFETCH_SOURCE_STATUS",
 ]
 
 # Type alias for cache keys
@@ -64,6 +66,16 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         Dictionary mapping request names to their protocol definitions
     """
     return {
+        "LOOKUP_WITH_SOURCE": ProtocolDefinition(
+            payload_classes=[KeyType, int, str, str],
+            response_class=str,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "QUERY_PREFETCH_SOURCE_STATUS": ProtocolDefinition(
+            payload_classes=[str, str],
+            response_class=tuple[int, list[tuple[int, int, str]]] | None,
+            handler_type=HandlerType.BLOCKING,
+        ),
         # Opt-in scheduler liveness; legacy LOOKUP payload/response unchanged.
         "LOOKUP_LEASED": ProtocolDefinition(
             payload_classes=[KeyType, int, str],

@@ -2,6 +2,7 @@
 """Tests for the multiprocess protocol registry (``RequestType`` + definitions)."""
 
 # Third Party
+import msgspec
 import pytest
 
 # First Party
@@ -52,6 +53,8 @@ FROZEN_WIRE_IDS = {
     "CB_PROTOCOL_HANDSHAKE": 33,
     "LOOKUP_LEASED": 34,
     "RENEW_SESSIONS": 35,
+    "LOOKUP_WITH_SOURCE": 36,
+    "QUERY_PREFETCH_SOURCE_STATUS": 37,
 }
 
 CB_REQUESTS = [
@@ -85,6 +88,26 @@ def test_wire_ids_are_unique() -> None:
 def test_every_request_type_has_a_definition() -> None:
     definitions = initialize_protocols()
     assert set(definitions) == set(RequestType)
+
+
+@pytest.mark.parametrize(
+    "response", [None, (0, []), (2, [(0, 256, "mixed"), (256, 512, "unknown")])]
+)
+def test_source_status_wire_roundtrip_preserves_logical_intervals(response):
+    definitions = initialize_protocols()
+    definition = definitions[RequestType.QUERY_PREFETCH_SOURCE_STATUS]
+    assert (
+        msgspec.msgpack.decode(
+            msgspec.msgpack.encode(response), type=definition.response_class
+        )
+        == response
+    )
+    # Older clients still decode precisely the unchanged integer/None response.
+    legacy = definitions[RequestType.QUERY_PREFETCH_STATUS]
+    assert (
+        msgspec.msgpack.decode(msgspec.msgpack.encode(2), type=legacy.response_class)
+        == 2
+    )
 
 
 def test_blend_requests_are_registered() -> None:

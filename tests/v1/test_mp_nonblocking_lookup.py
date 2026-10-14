@@ -55,6 +55,7 @@ class Client:
         self.status = CheckedFuture()
         self.replies: deque[MessagingFuture[Any]] = deque([self.status])
         self.lookups: list[Any] = []
+        self.source_attempts: list[str] = []
         self.queries: list[str] = []
         self.frees: list[Any] = []
         self.ends: list[str] = []
@@ -74,6 +75,15 @@ class Client:
     def ping(self, instance_id: int | None) -> MessagingFuture[Any]:
         """Reply to scheduler health checks without transport or GPU work."""
         return ready(True)
+
+    def lookup_with_source(self, key, tp_size, attempt, credential):
+        self.source_attempts.append(attempt)
+        assert not credential
+        return self.lookup(key, tp_size)
+
+    def query_prefetch_source_status(self, request_id, attempt):
+        assert attempt == self.source_attempts[-1]
+        return self.query_prefetch_status(request_id)
 
     def query_prefetch_status(self, request_id: str) -> MessagingFuture[Any]:
         """Return the next explicitly prepared status response."""
@@ -158,6 +168,31 @@ def resolved(adapter: LMCacheMPSchedulerAdapter) -> int:
         if result is not None:
             return result
     raise AssertionError("completed status did not become observable")
+
+
+def test_multi_mp_sources_take_common_prefix_without_counting_ranks(make_adapter):
+    adapter, clients = make_adapter(
+        count=2,
+        extra_config={
+            "lmcache.mp.source_token_attribution": True,
+        },
+    )
+    adapter.maybe_submit_lookup_request("r", list(range(256)))
+    for client in clients:
+        client.ack.set_result("source_tokens_v1")
+    clients[0].status.set_result((3, [(0, 192, "local_cpu")]))
+    clients[1].status.set_result((2, [(0, 64, "local_cpu"), (64, 128, "remote_store")]))
+    assert resolved(adapter) == 128
+    assert adapter.get_lookup_source_spans("r") == [
+        (0, 64, "local_cpu"),
+        (64, 128, "mixed"),
+    ]
+    assert len(clients[0].frees) == 1
+    previous_attempt = clients[0].source_attempts[-1]
+    adapter.cleanup_lookup_result("r")
+    assert adapter.get_lookup_source_spans("r") == []
+    adapter.maybe_submit_lookup_request("r", list(range(256)))
+    assert clients[0].source_attempts[-1] != previous_attempt
 
 
 @pytest.mark.parametrize("setting", [False, "false"])

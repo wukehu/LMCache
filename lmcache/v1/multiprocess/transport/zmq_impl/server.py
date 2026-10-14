@@ -91,6 +91,16 @@ def get_zmq_handler_specs(module: EngineModule) -> list[HandlerSpec]:
     if isinstance(module, LookupModule):
         return [
             HandlerSpec(
+                RequestType.LOOKUP_WITH_SOURCE,
+                module.lookup_with_source,
+                ThreadPoolType.NORMAL,
+            ),
+            HandlerSpec(
+                RequestType.QUERY_PREFETCH_SOURCE_STATUS,
+                module.query_prefetch_source_status,
+                ThreadPoolType.NORMAL,
+            ),
+            HandlerSpec(
                 RequestType.LOOKUP_LEASED,
                 module.lookup_leased,
                 ThreadPoolType.NORMAL,

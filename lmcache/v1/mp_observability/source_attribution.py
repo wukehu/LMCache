@@ -18,7 +18,113 @@ import math
 import threading
 
 SOURCES = frozenset({"local_cpu", "local_disk", "remote_store", "peer", "unknown"})
+TOKEN_SOURCES = SOURCES | {"mixed"}
+# Half-open logical token intervals, never one interval per GPU shard.
+SourceSpan = tuple[int, int, str]
 logger = logging.getLogger(__name__)
+
+
+def source_token_attribution_enabled(config: Mapping[str, Any] | None) -> bool:
+    """Resolve the opt-in switch consistently for scheduler, workers and logger."""
+    value = (config or {}).get("lmcache.mp.source_token_attribution", False)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def merge_token_sources(
+    shards: Iterable[Iterable[SourceSpan]], start: int, end: int
+) -> list[SourceSpan]:
+    """Intersect required shard provenance; gaps are unknown, differences mixed.
+
+    Every required MP server must be present, including those with no provenance.
+    Missing/overlapping/invalid provenance never becomes a known source. The
+    output partitions [start, end) exactly once, independent of TP shard count.
+    """
+    if start < 0 or end < start:
+        raise ValueError("invalid token interval")
+    inputs = list(shards)
+    events: dict[int, list[tuple[int, str, int]]] = defaultdict(list)
+    events[start]
+    events[end]
+    for shard, spans in enumerate(inputs):
+        for lo, hi, source in spans:
+            lo, hi = max(start, lo), min(end, hi)
+            if hi > lo:
+                events[lo].append((shard, source, 1))
+                events[hi].append((shard, source, -1))
+    active: list[dict[str, int]] = [defaultdict(int) for _ in inputs]
+    result: list[SourceSpan] = []
+    ordered = sorted(events)
+    for lo, hi in zip(ordered, ordered[1:], strict=False):
+        for shard, source, delta in events[lo]:
+            active[shard][source] += delta
+            if active[shard][source] == 0:
+                del active[shard][source]
+        sources = []
+        for covering in active:
+            sources.append(
+                next(iter(covering))
+                if sum(covering.values()) == 1 and next(iter(covering)) in TOKEN_SOURCES
+                else "unknown"
+            )
+        source = (
+            "unknown"
+            if not sources or "unknown" in sources
+            else sources[0]
+            if len(set(sources)) == 1
+            else "mixed"
+        )
+        if result and result[-1][2] == source:
+            result[-1] = (result[-1][0], hi, source)
+        else:
+            result.append((lo, hi, source))
+    return result
+
+
+class TokenConsumptionLedger:
+    """One allocated external prefix, with separate load and execution evidence.
+
+    Observations return deltas, not cumulative counters. Repeated callbacks are
+    idempotent; invalidation prevents a late completion from claiming reuse.
+    A new allocation must create a new ledger. No storage locks are modified.
+    """
+
+    def __init__(self, spans: Iterable[SourceSpan], start: int, end: int) -> None:
+        self.spans = merge_token_sources([spans], start, end)
+        self.start = start
+        self.end = end
+        self._loaded = False
+        self._invalid = False
+        self._consumed_end = start
+
+    def invalidate(self) -> None:
+        """Retire this allocation on failure, preemption or cancellation."""
+        self._invalid = True
+
+    def loaded(self) -> dict[str, int]:
+        """Confirm aggregate GPU load completion once, without claiming reuse."""
+        if self._invalid or self._loaded:
+            return {}
+        self._loaded = True
+        return self._counts(self.start, self.end)
+
+    def consumed(self, prefix_tokens: int) -> dict[str, int]:
+        """Confirm external prefix read by a successfully executed model step."""
+        if self._invalid or not self._loaded:
+            return {}
+        end = min(self.end, prefix_tokens)
+        if end <= self._consumed_end:
+            return {}
+        counts = self._counts(self._consumed_end, end)
+        self._consumed_end = end
+        return counts
+
+    def _counts(self, start: int, end: int) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for lo, hi, source in self.spans:
+            count = min(hi, end) - max(lo, start)
+            if count > 0:
+                counts[source] += count
+        return dict(counts)
 
 
 def payload_sizes(layouts: Mapping[int, Any]) -> dict[int, int]:

@@ -17,8 +17,11 @@ import pytest
 # First Party
 from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchHandle
 from lmcache.v1.mp_observability.event import EventType
+from lmcache.v1.mp_observability.source_attribution import Source, SourceLedger
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.modules.lookup import LookupModule
+from lmcache.v1.multiprocess.modules.lookup import LookupModule, _PrefetchJob
+from lmcache.v1.multiprocess.mq import MessageQueueServer
+from lmcache.v1.multiprocess.protocols.base import RequestType
 import lmcache.v1.multiprocess.modules.lookup as lookup_module
 
 CHUNK_SIZE = 256
@@ -68,6 +71,7 @@ def _end_metadata(
     """
     ctx = MagicMock()
     ctx.chunk_size = CHUNK_SIZE
+    ctx.storage_manager.supports_owned_reads.return_value = False
     ctx.event_bus.has_subscribers.return_value = False
     ctx.layout_desc_registry.find.return_value = MagicMock() if layout_found else None
     ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
@@ -188,3 +192,67 @@ def test_early_exit_reason(kwargs, reason):
     assert meta["early_exit_reason"] == reason
     assert meta["requested_tokens"] == 0
     assert meta["hit_tokens"] == 0
+
+
+def test_versioned_source_status_preserves_tp_provenance_and_rejects_old_attempt():
+    """Use the real lookup fold/poll path, mocking only native bitmap folding."""
+    ctx = MagicMock()
+    ctx.chunk_size = CHUNK_SIZE
+    ctx.event_bus.has_subscribers.return_value = False
+    ledger = SourceLedger(
+        MagicMock(),
+        Source("local_cpu", "l1", "cpu", "l1"),
+        {"l2:0": "remote_store"},
+        "lookup",
+    )
+    ledger.resident([("a0", 128), ("a1", 128), ("b0", 128)])
+    ledger.loaded(0, "mooncake", [("b1", 128)])
+    spec = MagicMock(keys=["a0", "a1", "b0", "b1"], source_ledger=ledger)
+    handle = PrefetchHandle(
+        0, "req-1", (0, 1, 2), 1, 4, time.monotonic(), source_spec=spec
+    )
+    job = _PrefetchJob(
+        handle, 2, "req-1", 512, attn_desc=AttnWindowDesc([-1], 2), source_attempt="new"
+    )
+    module = LookupModule(ctx)
+    module._prefetch_jobs["req-1"] = job
+    assert module.query_prefetch_source_status("req-1", "old") == (0, [])
+    ctx.storage_manager.query_prefetch_status.assert_not_called()
+    with patch.object(lookup_module, "fold_unfold_ranked", return_value=(2, None)):
+        result = module.query_prefetch_source_status("req-1", "new")
+    assert result == (2, [(0, 256, "local_cpu"), (256, 512, "mixed")])
+    assert module.query_prefetch_source_status("req-1", "new") == (0, [])
+
+
+def test_source_attempt_is_bound_before_prefetch_job_publication():
+    """A delayed lookup cannot relabel a replacement job after registration."""
+    ctx = MagicMock()
+    ctx.chunk_size = CHUNK_SIZE
+    ctx.storage_manager.supports_owned_reads.return_value = False
+    ctx.layout_desc_registry.find.return_value = None
+    module = LookupModule(ctx)
+    published = []
+
+    def publish(job):
+        assert job.source_attempt == "attempt-A"
+        published.append(job)
+
+    with patch.object(module, "_register_prefetch_job", side_effect=publish):
+        assert (
+            module.lookup_with_source(_lookup_key(1), 1, "attempt-A", "")
+            == "source_tokens_v1"
+        )
+    assert len(published) == 1
+
+
+def test_legacy_and_source_lookup_handlers_pass_real_rpc_registration_contract():
+    """Exercise the server validator, including defaults and return wire types."""
+    module = LookupModule(MagicMock())
+    server = MessageQueueServer.__new__(MessageQueueServer)
+    for request_type, handler in (
+        (RequestType.LOOKUP, module.lookup),
+        (RequestType.LOOKUP_LEASED, module.lookup_leased),
+        (RequestType.LOOKUP_WITH_SOURCE, module.lookup_with_source),
+        (RequestType.QUERY_PREFETCH_SOURCE_STATUS, module.query_prefetch_source_status),
+    ):
+        assert server._inspect_handler_signature(request_type, handler)

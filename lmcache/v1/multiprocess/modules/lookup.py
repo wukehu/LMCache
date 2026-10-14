@@ -20,6 +20,10 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.mp_observability.source_attribution import (
+    SourceSpan,
+    merge_token_sources,
+)
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.session import Session
@@ -101,6 +105,7 @@ class _PrefetchJob:
     early_exit_reason: str = ""
     # Owned L1 lookups retain the exact lifetime, never a request-ID replacement.
     owned_session: Session | None = None
+    source_attempt: str = ""
 
 
 class LookupModule:
@@ -153,6 +158,16 @@ class LookupModule:
     def lookup_leased(
         self, key: IPCCacheServerKey, tp_size: int, credential: str
     ) -> None:
+        """Serve the unchanged three-argument leased lookup RPC."""
+        self._lookup_leased_with_attempt(key, tp_size, credential, "")
+
+    def _lookup_leased_with_attempt(
+        self,
+        key: IPCCacheServerKey,
+        tp_size: int,
+        credential: str,
+        source_attempt: str = "",
+    ) -> None:
         """Start lookup with bounded scheduler liveness for owned-read mode.
 
         The credential identifies this lookup incarnation, not cache content.
@@ -164,7 +179,7 @@ class LookupModule:
         self._ctx.session_manager.get_or_create(key.request_id)
         if not self._ctx.session_manager.bind_liveness(key.request_id, credential):
             raise ValueError("lookup session credential is not active")
-        self.lookup(key, tp_size)
+        self._lookup_with_attempt(key, tp_size, source_attempt)
 
     def renew_sessions(self, credentials: list[tuple[str, str]]) -> list[str]:
         """Renew live Sessions and their exact pending reservations, not counts."""
@@ -184,7 +199,9 @@ class LookupModule:
                         session, credential=credential
                     )
                     if deadline is not None and keys:
-                        self._ctx.storage_manager.renew_owned_read(list(keys), owner, deadline)
+                        self._ctx.storage_manager.renew_owned_read(
+                            list(keys), owner, deadline
+                        )
             except RuntimeError:
                 # Cancellation or expiry can win after authentication. Never
                 # publish into a replacement Session or acknowledge revival.
@@ -193,9 +210,16 @@ class LookupModule:
         return accepted
 
     def lookup(
+        self, key: IPCCacheServerKey, tp_size: int
+    ) -> None:
+        """Serve the unchanged two-argument legacy lookup RPC."""
+        self._lookup_with_attempt(key, tp_size, "")
+
+    def _lookup_with_attempt(
         self,
         key: IPCCacheServerKey,
         tp_size: int,
+        source_attempt: str = "",
     ) -> None:
         """Submit a prefix lookup.
 
@@ -210,7 +234,8 @@ class LookupModule:
         model_name, world_size = key.model_name, key.world_size
         owned_session = (
             self._ctx.session_manager.get_or_create(key.request_id)
-            if self._ctx.storage_manager.supports_owned_reads() else None
+            if self._ctx.storage_manager.supports_owned_reads()
+            else None
         )
         self._ctx.event_bus.publish(
             Event(
@@ -249,6 +274,7 @@ class LookupModule:
                     cache_salt=key.cache_salt,
                     early_exit_reason="no_gpu_context",
                     owned_session=owned_session,
+                    source_attempt=source_attempt,
                 )
             )
             return
@@ -274,6 +300,7 @@ class LookupModule:
                     cache_salt=key.cache_salt,
                     early_exit_reason="empty_chunk_hashes",
                     owned_session=owned_session,
+                    source_attempt=source_attempt,
                 )
             )
             return
@@ -311,7 +338,8 @@ class LookupModule:
             model_name, world_size
         )
         session = (
-            owned_session if owned_session is not None
+            owned_session
+            if owned_session is not None
             else self._ctx.session_manager.get_or_create(key.request_id)
         )
         self._cancel_owned_session(session)
@@ -320,10 +348,13 @@ class LookupModule:
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
         read_owner = (
             session.bind_owned_read(obj_keys)
-            if self._ctx.storage_manager.supports_owned_reads() else None
+            if self._ctx.storage_manager.supports_owned_reads()
+            else None
         )
         if read_owner is not None:
-            logger.info("Owned lookup request_id=%s owner=%s", key.request_id, read_owner)
+            logger.info(
+                "Owned lookup request_id=%s owner=%s", key.request_id, read_owner
+            )
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -352,6 +383,7 @@ class LookupModule:
                     cache_salt=key.cache_salt,
                     early_exit_reason="no_group_layout_descs",
                     owned_session=owned_session,
+                    source_attempt=source_attempt,
                 )
             )
             return
@@ -359,7 +391,8 @@ class LookupModule:
         with session.owned_reservation_scope(read_owner):
             deadline = (
                 self._ctx.session_manager.read_lease_deadline(session)
-                if read_owner is not None else None
+                if read_owner is not None
+                else None
             )
             handle = self._ctx.storage_manager.submit_prefetch_task(
                 PrefetchRequestSpec(
@@ -379,6 +412,7 @@ class LookupModule:
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
                 owned_session=owned_session,
+                source_attempt=source_attempt,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
                 model_name=model_name,
@@ -509,7 +543,9 @@ class LookupModule:
             if owner is None:
                 return
             obj_keys = resolve_prefetched_obj_keys(
-                self._ctx, key, session.prefetch_hit_chunks,
+                self._ctx,
+                key,
+                session.prefetch_hit_chunks,
                 session.prefetch_locked_gids,
             )
             self._ctx.storage_manager.cancel_owned_read(obj_keys, owner)
@@ -624,6 +660,57 @@ class LookupModule:
             for group_keys in per_group:
                 obj_keys.extend(group_keys[lo:hi])
         return obj_keys
+
+    def lookup_with_source(
+        self, key: IPCCacheServerKey, tp_size: int, attempt: str, credential: str
+    ) -> str:
+        """Start an opt-in provenance attempt without changing lease semantics."""
+        if not attempt:
+            raise ValueError("source attempt must not be empty")
+        if credential:
+            self._lookup_leased_with_attempt(key, tp_size, credential, attempt)
+        else:
+            self._lookup_with_attempt(key, tp_size, attempt)
+        return "source_tokens_v1"
+
+    def query_prefetch_source_status(
+        self, request_id: str, attempt: str
+    ) -> tuple[int, list[SourceSpan]] | None:
+        """Consume only the matching attempt and return logical prefix origins.
+
+        Legacy polling remains an integer. Unsupported sliding-window layouts
+        return unknown provenance rather than pretending every shard was read.
+        """
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+            if job is None or not attempt or job.source_attempt != attempt:
+                return (0, [])
+        found_count = self._query_prefetch_job(job)
+        if found_count is None:
+            return None
+        chunk_size = self._ctx.chunk_size
+        end = found_count * chunk_size
+        spec = job.handle.source_spec
+        if (
+            spec is None
+            or spec.source_ledger is None
+            or any(w >= 0 for w in job.attn_desc.num_chunks_in_sw)
+        ):
+            return (found_count, merge_token_sources([], 0, end))
+        snapshot = spec.source_ledger.snapshot()
+        stride = job.attn_desc.num_object_groups * job.world_size
+        spans: list[SourceSpan] = []
+        for chunk in range(found_count):
+            keys = spec.keys[chunk * stride : (chunk + 1) * stride]
+            sources = [
+                snapshot[k].source.source if k in snapshot else "unknown" for k in keys
+            ]
+            # A shortened key list must not turn incomplete TP coverage into a hit.
+            if len(keys) != stride:
+                sources.append("unknown")
+            lo, hi = chunk * chunk_size, (chunk + 1) * chunk_size
+            spans.extend(merge_token_sources([[(lo, hi, s)] for s in sources], lo, hi))
+        return (found_count, merge_token_sources([spans], 0, end))
 
     def _query_prefetch_job(self, job: _PrefetchJob) -> int | None:
         """Consume only this captured job; a late owned result cannot revive it."""

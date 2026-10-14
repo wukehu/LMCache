@@ -74,6 +74,14 @@ class RequestClient(Protocol):
 
     def query_prefetch_status(self, request_id: str) -> MessagingFuture[Any]: ...
 
+    def lookup_with_source(
+        self, key: Any, tp_size: int, attempt: str, credential: str
+    ) -> MessagingFuture[Any]: ...
+
+    def query_prefetch_source_status(
+        self, request_id: str, attempt: str
+    ) -> MessagingFuture[Any]: ...
+
     def wait_prefetch_status(
         self, request_id: str, timeout: float
     ) -> MessagingFuture[Any]: ...

@@ -53,12 +53,18 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
     LMCacheMPWorkerMetadata,
+    LMCacheSourceTokenPromMetrics,
+    LMCacheSourceTokenStats,
 )
 from lmcache.integration.vllm.utils import (
     mla_only,
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.mp_observability.source_attribution import (
+    TokenConsumptionLedger,
+    source_token_attribution_enabled,
+)
 
 try:
     # First Party
@@ -490,6 +496,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cache_model_name = get_dcp_decorated_model_name(vllm_config, kv_cache_config)
 
         assert vllm_config.kv_transfer_config is not None
+
+        self._source_tokens_enabled = source_token_attribution_enabled(
+            vllm_config.kv_transfer_config.kv_connector_extra_config
+        )
+        self._source_token_stats = LMCacheSourceTokenStats()
+        if self._source_tokens_enabled:
+            # Third Party
+            from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+            pc = vllm_config.parallel_config
+            groups = getattr(kv_cache_config, "kv_cache_groups", ())
+            if (
+                not hasattr(KVConnectorBase_V1, "on_model_step_completed")
+                or pc.pipeline_parallel_size != 1
+                or getattr(pc, "decode_context_parallel_size", 1) != 1
+                or getattr(pc, "prefill_context_parallel_size", 1) != 1
+                or vllm_config.scheduler_config.async_scheduling
+                or vllm_config.speculative_config is not None
+                or len(groups) != 1
+                or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec)
+                or getattr(groups[0].kv_cache_spec, "sliding_window", None) is not None
+                or getattr(groups[0].kv_cache_spec, "attention_chunk_size", None)
+                is not None
+                or getattr(groups[0].kv_cache_spec, "non_causal", False)
+            ):
+                raise ValueError(
+                    "source token attribution requires the engine completion hook, "
+                    "PP1, synchronous non-speculative scheduling and "
+                    "one full-attention group"
+                )
 
         self._eager_prefetch: bool = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -964,7 +1000,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         Get the KV connector stats collected during the last interval.
         """
-        return None
+        if not getattr(self, "_source_tokens_enabled", False):
+            return None
+        result = self._source_token_stats
+        self._source_token_stats = LMCacheSourceTokenStats()
+        return result if not result.is_empty() else None
+
+    def _record_source_tokens(self, stage: str, counts: dict[str, int]) -> None:
+        """Accumulate bounded scheduler-only deltas for existing stats transport."""
+        values = self._source_token_stats.data.setdefault(stage, {})
+        for source, count in counts.items():
+            values[source] = values.get(source, 0) + count
+
+    def on_model_step_completed(self, request_id: str, prefix_tokens: int) -> None:
+        """Count only external prefix used by this valid, successful engine step."""
+        if not getattr(self, "_source_tokens_enabled", False):
+            return
+        tracker = self.request_trackers.get(request_id)
+        if tracker is not None and tracker.source_tokens is not None:
+            self._record_source_tokens(
+                "reused", tracker.source_tokens.consumed(prefix_tokens)
+            )
 
     # ==============================
     # Scheduler-side methods
@@ -1079,6 +1135,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             * self._hit_alignment_tokens
         )
         tracker.num_lmcache_hit_tokens = ret
+        if getattr(self, "_source_tokens_enabled", False):
+            tracker.source_prefix_start = num_computed_tokens
 
         need_to_load = max(0, ret - num_computed_tokens)
 
@@ -1161,6 +1219,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         condition = num_external_tokens > 0 and tracker.needs_retrieve()
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
+            if condition and getattr(self, "_source_tokens_enabled", False):
+                spans = self.scheduler_adapter.get_lookup_source_spans(
+                    request.request_id
+                )
+                start = tracker.source_prefix_start
+                end = min(start + num_external_tokens, tracker.num_lmcache_hit_tokens)
+                tracker.source_tokens = TokenConsumptionLedger(spans, start, end)
+                # The aligned GPU write can include overlap and the last token
+                # which the engine must recompute. Keep that denominator separate.
+                tracker.source_loaded_tokens = TokenConsumptionLedger(
+                    spans, tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens
+                )
             # If need to retrieve, change to WAITING_FOR_LOAD
             # Otherwise, change to READY
             tracker.state = (
@@ -1214,6 +1284,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         metadata = LMCacheMPConnectorMetadata()
+        if getattr(self, "_source_tokens_enabled", False):
+            for request_id in scheduler_output.preempted_req_ids or ():
+                tracker = self.request_trackers.get(request_id)
+                if tracker is not None:
+                    for ledger in (tracker.source_tokens, tracker.source_loaded_tokens):
+                        if ledger is not None:
+                            ledger.invalidate()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
         metadata.aborted_retrieve_req_ids = self._aborted_retrieve_req_ids
         self._aborted_retrieve_req_ids = set()
@@ -1238,6 +1315,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        if getattr(self, "_source_tokens_enabled", False):
+            invalid = connector_output.invalid_block_ids or set()
+            for request_id, tracker in self.request_trackers.items():
+                failed = any(
+                    invalid.intersection(blocks)
+                    for blocks in tracker.allocated_block_ids.values()
+                )
+                if failed:
+                    for ledger in (tracker.source_tokens, tracker.source_loaded_tokens):
+                        if ledger is not None:
+                            ledger.invalidate()
+                elif tracker.state == LMCacheMPRequestState.LOADING and request_id in (
+                    connector_output.finished_recving or ()
+                ):
+                    if tracker.source_tokens is not None:
+                        tracker.source_tokens.loaded()
+                    if tracker.source_loaded_tokens is not None:
+                        self._record_source_tokens(
+                            "loaded", tracker.source_loaded_tokens.loaded()
+                        )
+
         for request_id in connector_output.finished_recving or ():
             tracker = self.request_trackers.get(request_id)
             if tracker is not None and tracker.state == LMCacheMPRequestState.LOADING:
@@ -1385,7 +1483,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         registered connectors to return their own KVConnectorStats object,
         which can implement custom aggregation logic on the data dict.
         """
-        return None
+        return LMCacheSourceTokenStats(data or {})
 
     @classmethod
     def build_prom_metrics(
@@ -1400,7 +1498,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         per-connector Prometheus metrics and implement observe() to
         expose connector transfer stats via Prometheus.
         """
-        return None
+        cfg = vllm_config.kv_transfer_config
+        if cfg is None or not source_token_attribution_enabled(
+            cfg.kv_connector_extra_config
+        ):
+            return None
+        return LMCacheSourceTokenPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     ##############################
     # Helper functions

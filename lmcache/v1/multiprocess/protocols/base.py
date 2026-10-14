@@ -93,6 +93,8 @@ class RequestType(enum.Enum):
 
     LOOKUP_LEASED = enum.auto()
     RENEW_SESSIONS = enum.auto()
+    LOOKUP_WITH_SOURCE = enum.auto()
+    QUERY_PREFETCH_SOURCE_STATUS = enum.auto()
 
     # Deprecated aliases.
     CB_REGISTER_ROPE_V3 = CB_REGISTER_ROPE

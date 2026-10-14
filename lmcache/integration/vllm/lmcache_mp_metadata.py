@@ -10,6 +10,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+)
 from vllm.v1.utils import ConstantList
 import torch
 
@@ -20,6 +24,10 @@ from lmcache.integration.vllm.utils import (
     extract_request_configs_from_request,
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
+from lmcache.v1.mp_observability.source_attribution import (
+    TOKEN_SOURCES,
+    TokenConsumptionLedger,
+)
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
 if TYPE_CHECKING:
@@ -78,6 +86,9 @@ class LMCacheMPRequestTracker:
     request_configs: dict[str, Any] | None = None
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
+    source_prefix_start: int = 0
+    source_tokens: TokenConsumptionLedger | None = None
+    source_loaded_tokens: TokenConsumptionLedger | None = None
 
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
@@ -90,6 +101,9 @@ class LMCacheMPRequestTracker:
         self.num_lmcache_hit_tokens = 0
         self.state = LMCacheMPRequestState.PREFETCHING
         self.mm_adjusted_prompt_ids = []
+        self.source_prefix_start = 0
+        self.source_tokens = None
+        self.source_loaded_tokens = None
         mm_hashes, mm_positions = extract_mm_features(request)
         if mm_hashes and mm_positions:
             prompt_ids = torch.tensor(request.prompt_token_ids)
@@ -410,3 +424,57 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
         for k, v in other.completed_store_requests.items():
             merged[k] = merged.get(k, 0) + v
         return LMCacheMPWorkerMetadata(completed_store_requests=merged)
+
+
+class LMCacheSourceTokenStats(KVConnectorStats):
+    """Scheduler-only logical deltas; never sum this once per TP worker."""
+
+    def reset(self) -> None:
+        self.data.clear()
+
+    def aggregate(self, other: KVConnectorStats) -> "LMCacheSourceTokenStats":
+        result = LMCacheSourceTokenStats()
+        for data in (self.data, other.data):
+            for stage in ("loaded", "reused"):
+                for source, count in data.get(stage, {}).items():
+                    if source in TOKEN_SOURCES and count > 0:
+                        values = result.data.setdefault(stage, {})
+                        values[source] = values.get(source, 0) + count
+        return result
+
+    def reduce(self) -> dict[str, int | float]:
+        return {
+            f"lmcache_{stage}_{source}_tokens": count
+            for stage, counts in self.data.items()
+            for source, count in counts.items()
+        }
+
+    def is_empty(self) -> bool:
+        return not any(self.data.values())
+
+
+class LMCacheSourceTokenPromMetrics(KVConnectorPromMetrics):
+    """Prometheus counters for successful load versus engine-confirmed reuse."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._counters = {
+            stage: self._counter_cls(
+                name=f"vllm:lmcache_{stage}_tokens_total",
+                documentation=(
+                    "Logical external KV tokens loaded to all required GPUs"
+                    if stage == "loaded"
+                    else "External prefix tokens used by a successful model step"
+                ),
+                labelnames=self._labelnames + ["source"],
+            )
+            for stage in ("loaded", "reused")
+        }
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
+        """Export scheduler deltas with bounded source labels only."""
+        values = self.per_engine_labelvalues[engine_idx]
+        for stage, counter in self._counters.items():
+            for source, count in transfer_stats_data.get(stage, {}).items():
+                if source in TOKEN_SOURCES and count > 0:
+                    counter.labels(*values, source).inc(count)
