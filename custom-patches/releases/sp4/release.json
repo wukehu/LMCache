@@ -1,0 +1,108 @@
+{
+  "release": "SP4",
+  "date": "2026-10-14",
+  "platform": "linux/amd64",
+  "image": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp4",
+  "digest": "sha256:dc305f33a17b6702dbbc924f07ecffdbb8e0919832ad056fc7d64c1f8285da5f",
+  "promotion": "alias of validated sp3-source-token-20261014-c2; no rebuild; original SP3 unchanged",
+  "base_image": {
+    "reference": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp3",
+    "digest": "sha256:d8d83d33c73f7f9e4f2cff478e5bd9167e124f66ee26208f81910b49aca6064c"
+  },
+  "source_commits": {
+    "lmcache": {
+      "repository": "https://github.com/wukehu/LMCache.git",
+      "commit": "3787008e5e7245ca38d0e62b042de07f3414c402",
+      "branch": "feature-sp3-source-token-consumption"
+    },
+    "vllm": {
+      "repository": "https://github.com/wukehu/vllm.git",
+      "commit": "2f73d706a18310825f4cf0a77f57898a6f9dd9b6",
+      "branch": "feature-sp3-source-token-consumption"
+    }
+  },
+  "inherited_dynamo": {
+    "repository": "http://192.168.70.8/aiinfrastack/dynamo-custom.git",
+    "commit": "61c27e38cbfc45852ca288dfaa85edcd66ff4def",
+    "source_release_tag": "runtime-sp3-20261013"
+  },
+  "inherited_versions": {
+    "dynamo": "1.4.0",
+    "vllm": "0.26.0",
+    "lmcache": "0.5.5",
+    "mooncake-transfer-engine-cuda13": "0.3.12",
+    "torch": "2.11.0+cu130",
+    "CUDA": "13.0",
+    "rustc": "1.96.1",
+    "maturin": "1.14.1",
+    "cmake": "3.31.6",
+    "ninja": "1.13.0"
+  },
+  "inherited_native_dependencies": {
+    "cutlass": {
+      "repository": "https://github.com/NVIDIA/cutlass.git",
+      "tag_hint": "v4.4.2",
+      "commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2"
+    },
+    "cargo_lock_sha256": {
+      "Cargo.lock": "3d09ce734fef4e848e8f4f7fcd5b2bc2bbe6a2b408ef306b6870f0da39656e81",
+      "rust-toolchain.toml": "6791dcb04edcb490caaf08590dbe1dd9d9954b46dab2095df12dc984f704f1a8",
+      "lib/bindings/python/pyproject.toml": "60bb13d3304a29b012a2593d192034194e3c07ea336ace7944c34d2525cf7d54"
+    },
+    "cuda_architectures": [
+      "75",
+      "80",
+      "86",
+      "89",
+      "90",
+      "100",
+      "120"
+    ],
+    "vllm_target": "_C_stable_libtorch",
+    "max_parallel_jobs_per_component": 8,
+    "stage_timeout_seconds": 1800,
+    "repository_shipped_fatbins": {
+      "lib/llm/src/block_manager/block/transfer/kernels/vectorized_copy.fatbin": {
+        "sha256": "b2119000573efab28d15b7fddd9a48816ad545e199ec821e9092dd0bd69c1508",
+        "recompiled": false,
+        "scope": "unchanged committed binary input, distinct from custom discovery Rust code"
+      }
+    }
+  },
+  "build": {
+    "base_reused_by_digest": true,
+    "additional_native_compilation": false,
+    "runtime_files": "manifest.json",
+    "recipe": "Dockerfile",
+    "verification": "verify.py",
+    "context": "Export the 13 files in manifest.json from source_commits into a clean context retaining paths. Copy Dockerfile, manifest.json and verify.py into its root. Build linux/amd64. This recipe rebuilds equivalent overlay contents; byte-identical image digest is not guaranteed."
+  },
+  "validation": {
+    "cpu": "LMCache 69 tests; vLLM 12 targeted tests; RPC validator 12 tests; changed-file lint passed",
+    "gpu": [
+      "TP1 single MP L1 / local FS / Mooncake",
+      "Same-node TP2 dual MP PP1 L1",
+      "Cross-node TP2 PP1, one GPU and one MP per node: local FS and Mooncake; 4 requests total"
+    ],
+    "cross_node_replay": {
+      "loaded_tokens": 512,
+      "reused_tokens": 511,
+      "native_external_tokens": 511,
+      "response_cached_tokens": 511,
+      "both_mp_real_retrieve": true,
+      "fresh_reader_l1_empty": true,
+      "cleanup": "complete"
+    },
+    "attribution_opt_in": "lmcache.mp.source_token_attribution=true",
+    "supported_scope": "PP1 synchronous non-speculative full attention single KV group; no DCP/PCP/HMA"
+  },
+  "limitations": [
+    "PP > 1 excluded from this delivery acceptance; existing work preserved separately",
+    "Numerical equivalence deferred",
+    "TP16 and long-duration/SLO acceptance not claimed",
+    "L2 adapters use existing legacy lock mode; this smoke does not revalidate >TTL leases",
+    "Async scheduling, speculative and mixed-source GPU cases not accepted",
+    "Dashboard window estimators are not exact same-request-cohort conversion"
+  ],
+  "dashboard": "Frozen version 13; unchanged"
+}

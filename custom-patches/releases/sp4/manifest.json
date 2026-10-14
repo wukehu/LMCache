@@ -1,0 +1,57 @@
+{
+  "base": "intellif.io/dynamo/vllm-runtime@sha256:d8d83d33c73f7f9e4f2cff478e5bd9167e124f66ee26208f81910b49aca6064c",
+  "files": [
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_connector.py",
+      "sha256": "d19fb4cd3e0530ab6835131a17af9a65761b7853bb699d381553b4bb65c6851e"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_metadata.py",
+      "sha256": "be5127851414cc12342a980f63174a9588222323e9d65a350b652eaa10efdb4e"
+    },
+    {
+      "path": "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+      "sha256": "a3f3a246a933761f799503f9664d1848334374936d45ebf60950d58b62f38e0d"
+    },
+    {
+      "path": "lmcache/v1/mp_observability/source_attribution.py",
+      "sha256": "5bc5c7e7322de89d8c15a809609660ccf00bd9419b2cdf2bccfc21ad0ef4b8b8"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lookup.py",
+      "sha256": "64244d6896991920cbe877e6156aba8795ed443695412bd1fcba1df1286005bb"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/base.py",
+      "sha256": "58573820bf7708eed1e12f306cac6b09b0c262ebe3f030e304b59352630796b6"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/engine.py",
+      "sha256": "885382b499e95c3a4bc45bc4547ff931151a3255b01e78fb31c6290dcbb0ff2a"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/base.py",
+      "sha256": "b59bdacd2a38078fd8e4e8992da002526543af9ccea5da575866a98f0db85b82"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/client.py",
+      "sha256": "2374fe40c123d91bfc46929f04f688c73277a43c6a5c284e2406ff836e153973"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/server.py",
+      "sha256": "1321b6153bf7da13dfd2b0a01f0f7628c0a75b732311090f18b0525a3f183526"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "sha256": "436569a7d0579963a1fb900ac385811244c319a44718807b006929c508beb219"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "sha256": "12b74a64d98d430810587f18ad320292c8515fc51912d080ecb78a89c62e6f03"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "sha256": "41ec340560cf0b9295d892ab47cdf317f20dff74bd0cf86243839d16cdc56d4e"
+    }
+  ]
+}
