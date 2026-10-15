@@ -1,0 +1,25 @@
+{
+  "release": "SP5",
+  "date": "2026-10-15",
+  "image": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp5",
+  "digest": "sha256:620a26047f46fa6d3e323ac66f13f74ab6c2716f8fdf7ef92b4bd2ba17c39557",
+  "base": "intellif.io/dynamo/vllm-runtime@sha256:dc305f33a17b6702dbbc924f07ecffdbb8e0919832ad056fc7d64c1f8285da5f",
+  "lmcache_source_commit": "51c9ebd15c7cea2a48aebb79188ad4d2dc7c6ea0",
+  "upstream_pr": "https://github.com/LMCache/LMCache/pull/5169",
+  "upstream_commit": "b4fcfa3983705815bb71f0f616260f29977557c5",
+  "adaptation": "v0.5.5 paths plus Raw tensor-device guard; upstream helper unchanged",
+  "validation": {
+    "11.40_gpu": "8 targeted GPU cases passed using the SP4 runtime with the SP5 wrapper loaded only into isolated probe processes",
+    "11.40_mp_recovery": "Both real MP servers: original callback false; patched recovery true; registrations 8 -> 9 -> 8; existing IDs unchanged; probe clients stopped and unregistered",
+    "final_image": "All 14 source hashes checked; Python compile checked; lmcache.cuda_ops and vllm._C_stable_libtorch imported",
+    "build_host_gpu_attempt": "Not accepted: Tesla P4 sm61 is below the inherited PyTorch supported architectures; no final-image GPU pass claimed on this host"
+  },
+  "deployment": "1061 remains on original SP4; no production worker restart or image replacement performed",
+  "limitations": [
+    "PP > 1 not part of delivery acceptance",
+    "numerical consistency remains a separate issue",
+    "first failed heartbeat cause is not established",
+    "VMM driver binding backported; VMM hardware path not separately validated"
+  ],
+  "recipe": "Export the single wrapper file from lmcache_source_commit retaining its path; copy Dockerfile, manifest.json, verify.py to the clean context root. Build linux/amd64 and verify by manifest hashes. No native compilation."
+}
