@@ -9,8 +9,10 @@ torch storage path cannot do or what only the raw path must get right
 """
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
+import threading
 
 # Third Party
 import pytest
@@ -21,6 +23,7 @@ from lmcache.v1.platform import resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 from lmcache.v1.platform.cuda import CudaDeviceSpec
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper, RawCudaIPCWrapper
+from lmcache.v1.platform.cuda.utils import _cuda
 from lmcache.v1.platform.isolated_ipc import is_isolated_ipc, set_isolated_ipc
 
 pytestmark = [
@@ -345,3 +348,83 @@ def test_cross_process_round_trip_of_interior_view(kind: str) -> None:
             child.kill()
             child.join()
     assert child.exitcode == 0
+
+
+@pytest.mark.parametrize("device_index", [0, 1])
+@pytest.mark.parametrize("existing_context", [False, True])
+def test_raw_wrapper_export_on_background_thread(
+    device_index: int, existing_context: bool
+) -> None:
+    """Export succeeds without a thread context and restores another GPU context."""
+    if device_index >= torch.cuda.device_count():
+        pytest.skip("requires a second CUDA device")
+    if existing_context and torch.cuda.device_count() < 2:
+        pytest.skip("requires another CUDA context")
+    tensor = torch.arange(1024, device=f"cuda:{device_index}", dtype=torch.float32)
+
+    def export() -> None:
+        if existing_context:
+            torch.cuda.set_device(1 - device_index)
+            _cuda.runtime.cudaSetDevice(1 - device_index)
+        else:
+            (err,) = _cuda.driver.cuCtxSetCurrent(_cuda.driver.CUcontext(0))
+            assert int(err) == 0
+        err, before = _cuda.driver.cuCtxGetCurrent()
+        assert int(err) == 0
+        if not existing_context:
+            assert int(before) == 0
+        wrapper = RawCudaIPCWrapper(tensor)
+        assert DeviceIPCWrapper.Serialize(wrapper)
+        if existing_context:
+            err, after = _cuda.driver.cuCtxGetCurrent()
+            assert int(err) == 0 and int(after) == int(before)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(export).result(timeout=15)
+
+
+def test_raw_wrapper_export_error_restores_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed driver export must restore the caller's device context."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires a second CUDA device")
+    tensor = torch.zeros(1024, device="cuda:1")
+    with torch.cuda.device(0):
+        _cuda.runtime.cudaSetDevice(0)
+        _, before = _cuda.driver.cuCtxGetCurrent()
+        monkeypatch.setattr(
+            _cuda.driver,
+            "cuMemGetAddressRange",
+            lambda _ptr: (_cuda.driver.CUresult.CUDA_ERROR_INVALID_VALUE,),
+        )
+        with pytest.raises(RuntimeError, match="cuMemGetAddressRange failed"):
+            RawCudaIPCWrapper(tensor)
+        _, after = _cuda.driver.cuCtxGetCurrent()
+        assert int(after) == int(before)
+
+
+def test_raw_wrapper_constructs_on_a_fresh_thread() -> None:
+    """Regression: the MP heartbeat re-registers the KV caches from its own
+    thread after a server restart. A fresh thread has no current CUDA
+    context, and the driver call in ``RawCudaIPCWrapper`` used to fail
+    there with ``CUDA_ERROR_INVALID_CONTEXT`` on every retry, so the worker
+    never recovered.
+    """
+    base = torch.ones(1024, device=DEVICE, dtype=torch.float32)
+    view = base[256:512]
+    result: dict[str, object] = {}
+
+    def construct() -> None:
+        try:
+            result["wrapper"] = RawCudaIPCWrapper(view)
+        except Exception as exc:  # report, don't raise across the thread
+            result["error"] = exc
+
+    thread = threading.Thread(target=construct)
+    thread.start()
+    thread.join()
+
+    assert "error" not in result, result.get("error")
+    wrapper = result["wrapper"]
+    assert isinstance(wrapper, RawCudaIPCWrapper)
+    assert wrapper.shape == (256,)
+    assert wrapper._nbytes == 256 * 4

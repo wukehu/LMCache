@@ -217,6 +217,50 @@ class CudaIPCWrapper(DeviceIPCWrapper):
         return t
 
 
+def _bind_primary_context(device_index: int) -> None:
+    """Make the primary CUDA context of ``device_index`` current on the
+    calling thread if the thread has no current context yet.
+
+    The CUDA runtime binds the primary context lazily on a thread's first
+    runtime call; the driver API never does. The IPC wrappers below call
+    the driver API directly and are not only constructed on the worker's
+    main thread: the MP connector's heartbeat re-registers the KV caches
+    from its own thread after a server restart, and on that thread
+    ``cuMemGetAddressRange`` failed with ``CUDA_ERROR_INVALID_CONTEXT`` on
+    every retry, so the worker never recovered.
+
+    A thread that already has a current context is left untouched.
+
+    Args:
+        device_index: CUDA device ordinal whose primary context to bind.
+
+    Raises:
+        RuntimeError: If the driver cannot look up or bind the context.
+    """
+    err, ctx = _cuda.driver.cuCtxGetCurrent()
+    if err == _cuda.driver.CUresult.CUDA_SUCCESS and int(ctx) != 0:
+        return
+    err, device = _cuda.driver.cuDeviceGet(device_index)
+    if err != _cuda.driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGet({device_index}) failed: {err}")
+    # The primary context is already alive (torch owns the tensor). Retain
+    # only to obtain its handle, make it current, then drop the extra
+    # reference: the thread keeps the context as its current one and the
+    # runtime's own reference keeps it alive, so the process reference
+    # count is left exactly as it was.
+    err, ctx = _cuda.driver.cuDevicePrimaryCtxRetain(device)
+    if err != _cuda.driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDevicePrimaryCtxRetain({device_index}) failed: {err}")
+    (err,) = _cuda.driver.cuCtxSetCurrent(ctx)
+    (release_err,) = _cuda.driver.cuDevicePrimaryCtxRelease(device)
+    if err != _cuda.driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuCtxSetCurrent failed: {err}")
+    if release_err != _cuda.driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"cuDevicePrimaryCtxRelease({device_index}) failed: {release_err}"
+        )
+
+
 class RawCudaIPCWrapper(DeviceIPCWrapper):
     """IPC wrapper that shares CUDA tensors through driver-level IPC only.
 
@@ -294,22 +338,26 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
             )
 
         data_ptr = tensor.data_ptr()
-        range_result = _cuda.driver.cuMemGetAddressRange(
-            _cuda.driver.CUdeviceptr(data_ptr)
-        )
-        if range_result[0] != 0:
-            raise RuntimeError(
-                f"cuMemGetAddressRange failed: {range_result[0]} "
-                f"(ptr=0x{data_ptr:x}). " + _NON_IPC_MEMORY_HINT
+        # Select the tensor's device if this thread already has another GPU's
+        # context. The upstream helper handles a missing context, including GPU 0.
+        with torch.cuda.device(tensor.device):
+            _bind_primary_context(tensor.device.index)
+            range_result = _cuda.driver.cuMemGetAddressRange(
+                _cuda.driver.CUdeviceptr(data_ptr)
             )
-        _err, alloc_base, _alloc_size = range_result
+            if range_result[0] != 0:
+                raise RuntimeError(
+                    f"cuMemGetAddressRange failed: {range_result[0]} "
+                    f"(ptr=0x{data_ptr:x}). " + _NON_IPC_MEMORY_HINT
+                )
+            _err, alloc_base, _alloc_size = range_result
 
-        err, ipc_handle = _cuda.runtime.cudaIpcGetMemHandle(int(alloc_base))
-        if err != _cuda.runtime.cudaError_t.cudaSuccess:
-            raise RuntimeError(
-                f"cudaIpcGetMemHandle failed: {err} (ptr=0x{data_ptr:x}). "
-                + _NON_IPC_MEMORY_HINT
-            )
+            err, ipc_handle = _cuda.runtime.cudaIpcGetMemHandle(int(alloc_base))
+            if err != _cuda.runtime.cudaError_t.cudaSuccess:
+                raise RuntimeError(
+                    f"cudaIpcGetMemHandle failed: {err} (ptr=0x{data_ptr:x}). "
+                    + _NON_IPC_MEMORY_HINT
+                )
 
         # Store only what's needed for reconstruction. The handle maps
         # the whole allocation; the offset locates the tensor within it.
@@ -485,6 +533,7 @@ class VmmCudaIPCWrapper(DeviceIPCWrapper):
         kind: str = ""
         payload: object = None
         with torch.cuda.device(device_index):
+            _bind_primary_context(device_index)
             # Recover the allocation handle from the bare pointer (works
             # for interior pointers; adds one driver reference we must
             # release below).
