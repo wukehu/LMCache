@@ -24,10 +24,18 @@ SourceSpan = tuple[int, int, str]
 logger = logging.getLogger(__name__)
 
 
-def source_token_attribution_enabled(config: Mapping[str, Any] | None) -> bool:
-    """Resolve the opt-in switch consistently for scheduler, workers and logger."""
-    value = (config or {}).get("lmcache.mp.source_token_attribution", False)
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+def source_token_attribution_enabled(
+    config: Mapping[str, Any] | None, *, supported: bool = True
+) -> bool:
+    """Default on only for supported engine paths; explicit opt-in fails closed."""
+    key = "lmcache.mp.source_token_attribution"
+    value = (config or {}).get(key, True)
+    enabled = str(value).strip().lower() in ("1", "true", "yes", "on")
+    if enabled and not supported:
+        if key in (config or {}):
+            raise ValueError("source token attribution is unsupported by this engine path")
+        return False
+    return enabled
 
 
 def merge_token_sources(
@@ -95,6 +103,7 @@ class TokenConsumptionLedger:
         self._loaded = False
         self._invalid = False
         self._consumed_end = start
+        self._completed_prefix = start
 
     def invalidate(self) -> None:
         """Retire this allocation on failure, preemption or cancellation."""
@@ -117,6 +126,12 @@ class TokenConsumptionLedger:
         counts = self._counts(self._consumed_end, end)
         self._consumed_end = end
         return counts
+
+    def completed(self, prefix_tokens: int | None = None) -> dict[str, int]:
+        """Join load and successful frame evidence, regardless of arrival order."""
+        if prefix_tokens is not None:
+            self._completed_prefix = max(self._completed_prefix, prefix_tokens)
+        return self.consumed(self._completed_prefix)
 
     def _counts(self, start: int, end: int) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)

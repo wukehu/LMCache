@@ -86,6 +86,7 @@ class LMCacheMPRequestTracker:
     request_configs: dict[str, Any] | None = None
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
+    source_allocation_id: str | None = None
     source_prefix_start: int = 0
     source_tokens: TokenConsumptionLedger | None = None
     source_loaded_tokens: TokenConsumptionLedger | None = None
@@ -101,6 +102,7 @@ class LMCacheMPRequestTracker:
         self.num_lmcache_hit_tokens = 0
         self.state = LMCacheMPRequestState.PREFETCHING
         self.mm_adjusted_prompt_ids = []
+        self.source_allocation_id = None
         self.source_prefix_start = 0
         self.source_tokens = None
         self.source_loaded_tokens = None
@@ -375,6 +377,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        self.source_allocations: dict[str, str] = {}
         self.need_flush_before_forward: bool = False
         self.aborted_retrieve_req_ids: set[str] = set()
 

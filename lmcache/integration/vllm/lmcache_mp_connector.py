@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
 import sys
+import uuid
 
 # Third Party
 from vllm.config import VllmConfig
@@ -508,11 +509,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             pc = vllm_config.parallel_config
             groups = getattr(kv_cache_config, "kv_cache_groups", ())
             if (
-                not hasattr(KVConnectorBase_V1, "on_model_step_completed")
+                not hasattr(KVConnectorBase_V1, "on_model_step_completed_with_metadata")
                 or pc.pipeline_parallel_size != 1
                 or getattr(pc, "decode_context_parallel_size", 1) != 1
                 or getattr(pc, "prefill_context_parallel_size", 1) != 1
-                or vllm_config.scheduler_config.async_scheduling
                 or vllm_config.speculative_config is not None
                 or len(groups) != 1
                 or not isinstance(groups[0].kv_cache_spec, FullAttentionSpec)
@@ -521,11 +521,23 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 is not None
                 or getattr(groups[0].kv_cache_spec, "non_causal", False)
             ):
-                raise ValueError(
-                    "source token attribution requires the engine completion hook, "
-                    "PP1, synchronous non-speculative scheduling and "
-                    "one full-attention group"
+                self._source_tokens_enabled = source_token_attribution_enabled(
+                    vllm_config.kv_transfer_config.kv_connector_extra_config,
+                    supported=False,
                 )
+                logger.warning(
+                    "Source token attribution disabled: requires completion hook, "
+                    "PP1, non-speculative scheduling and one "
+                    "full-attention group; KV caching remains enabled"
+                )
+
+        # Keep adapter RPC selection consistent with the validated connector.
+        source_extra_config = dict(
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        source_extra_config["lmcache.mp.source_token_attribution"] = (
+            self._source_tokens_enabled
+        )
 
         self._eager_prefetch: bool = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -627,7 +639,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 model_name=cache_model_name,
                 vllm_block_size=scheduler_block_size,
                 parallel_strategy=parallel_strategy,
-                extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                extra_config=source_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
             self._aborted_retrieve_req_ids: set[str] = set()
@@ -655,7 +667,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 model_name=cache_model_name,
                 vllm_block_size=scheduler_block_size,
                 parallel_strategy=parallel_strategy,
-                extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                extra_config=source_extra_config,
             )
             if self.transfer_intermediate_tensors:
                 # First Party
@@ -1022,6 +1034,45 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "reused", tracker.source_tokens.consumed(prefix_tokens)
             )
 
+    def _confirm_source_load(self, tracker: LMCacheMPRequestTracker) -> None:
+        if tracker.source_tokens is not None:
+            tracker.source_tokens.loaded()
+            self._record_source_tokens("reused", tracker.source_tokens.completed())
+        if tracker.source_loaded_tokens is not None:
+            self._record_source_tokens("loaded", tracker.source_loaded_tokens.loaded())
+
+    def on_model_step_completed_with_metadata(
+        self,
+        request_id: str,
+        prefix_tokens: int,
+        metadata: KVConnectorMetadata | None,
+        connector_output: KVConnectorOutput | None = None,
+    ) -> None:
+        """Count only the successful frame that owns this external KV allocation."""
+        if not getattr(self, "_source_tokens_enabled", False):
+            return
+        tracker = self.request_trackers.get(request_id)
+        if (
+            tracker is None
+            or tracker.source_tokens is None
+            or not isinstance(metadata, LMCacheMPConnectorMetadata)
+            or tracker.source_allocation_id is None
+            or metadata.source_allocations.get(request_id) != tracker.source_allocation_id
+        ):
+            return
+        # Observe only provenance here, never execute transfer/free side effects.
+        # A same-frame receive must be accounted before terminal request cleanup.
+        if connector_output is not None:
+            invalid = connector_output.invalid_block_ids or set()
+            if any(invalid.intersection(ids) for ids in tracker.allocated_block_ids.values()):
+                tracker.source_tokens.invalidate()
+                if tracker.source_loaded_tokens is not None:
+                    tracker.source_loaded_tokens.invalidate()
+                return
+            if request_id in (connector_output.finished_recving or ()):
+                self._confirm_source_load(tracker)
+        self._record_source_tokens("reused", tracker.source_tokens.completed(prefix_tokens))
+
     # ==============================
     # Scheduler-side methods
     # ==============================
@@ -1225,6 +1276,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 start = tracker.source_prefix_start
                 end = min(start + num_external_tokens, tracker.num_lmcache_hit_tokens)
+                tracker.source_allocation_id = uuid.uuid4().hex
                 tracker.source_tokens = TokenConsumptionLedger(spans, start, end)
                 # The aligned GPU write can include overlap and the last token
                 # which the engine must recompute. Keep that denominator separate.
@@ -1299,6 +1351,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
 
+        if getattr(self, "_source_tokens_enabled", False):
+            metadata.source_allocations = {
+                request_id: tracker.source_allocation_id
+                for request_id in scheduler_output.num_scheduled_tokens
+                if (tracker := self.request_trackers.get(request_id)) is not None
+                and tracker.source_allocation_id is not None
+            }
+
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
 
@@ -1329,12 +1389,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 elif tracker.state == LMCacheMPRequestState.LOADING and request_id in (
                     connector_output.finished_recving or ()
                 ):
-                    if tracker.source_tokens is not None:
-                        tracker.source_tokens.loaded()
-                    if tracker.source_loaded_tokens is not None:
-                        self._record_source_tokens(
-                            "loaded", tracker.source_loaded_tokens.loaded()
-                        )
+                    self._confirm_source_load(tracker)
 
         for request_id in connector_output.finished_recving or ():
             tracker = self.request_trackers.get(request_id)
@@ -1500,7 +1555,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         cfg = vllm_config.kv_transfer_config
         if cfg is None or not source_token_attribution_enabled(
-            cfg.kv_connector_extra_config
+            cfg.kv_connector_extra_config,
+            supported=(
+                hasattr(KVConnectorBase_V1, "on_model_step_completed_with_metadata")
+                and vllm_config.parallel_config.pipeline_parallel_size == 1
+                and getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) == 1
+                and getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) == 1
+                and vllm_config.speculative_config is None
+            ),
         ):
             return None
         return LMCacheSourceTokenPromMetrics(

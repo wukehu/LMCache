@@ -70,8 +70,20 @@ def test_invalidated_allocation_ignores_late_load_and_model_callbacks(loaded_fir
 
 
 @pytest.mark.parametrize("flag", [None, False, "false", "0"])
-def test_source_token_switch_is_opt_in(flag):
+def test_source_token_switch_explicit_opt_out(flag):
     assert not source_token_attribution_enabled(
+        {"lmcache.mp.source_token_attribution": flag}
+    )
+
+
+@pytest.mark.parametrize("config", [None, {}, {"unrelated": False}])
+def test_source_token_switch_defaults_to_enabled(config):
+    assert source_token_attribution_enabled(config)
+
+
+@pytest.mark.parametrize("flag", [True, 1, "true", "1", "yes", "on"])
+def test_source_token_switch_explicit_enable(flag):
+    assert source_token_attribution_enabled(
         {"lmcache.mp.source_token_attribution": flag}
     )
 
@@ -147,3 +159,70 @@ def test_source_accounting_and_resident_read(monkeypatch, owned):
     finally:
         manager.close()
         provider.shutdown()
+
+
+@pytest.mark.parametrize("config", [None, {}, {"unrelated": True}])
+def test_default_attribution_does_not_block_unsupported_engine(config):
+    assert not source_token_attribution_enabled(config, supported=False)
+
+
+@pytest.mark.parametrize("flag", [False, "false", "0"])
+def test_explicit_opt_out_remains_valid_on_unsupported_engine(flag):
+    assert not source_token_attribution_enabled(
+        {"lmcache.mp.source_token_attribution": flag}, supported=False
+    )
+
+
+@pytest.mark.parametrize("flag", [True, "true", "1"])
+def test_explicit_attribution_requires_supported_engine(flag):
+    with pytest.raises(ValueError, match="unsupported"):
+        source_token_attribution_enabled(
+            {"lmcache.mp.source_token_attribution": flag}, supported=False
+        )
+
+
+@pytest.mark.parametrize("load_first", [False, True])
+def test_async_source_ledger_joins_load_and_execution_once(load_first):
+    ledger = TokenConsumptionLedger([(0, 512, "local_cpu")], 16, 511)
+    if load_first:
+        ledger.loaded()
+        assert ledger.completed(511) == {"local_cpu": 495}
+    else:
+        assert ledger.completed(511) == {}
+        ledger.loaded()
+        assert ledger.completed() == {"local_cpu": 495}
+    assert ledger.completed(1024) == {}
+    ledger.invalidate()
+    assert ledger.completed(2048) == {}
+
+
+@pytest.mark.parametrize("old_frame", [False, True])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_async_connector_rejects_old_allocation_and_invalid_load(old_frame, invalid):
+    from types import SimpleNamespace
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+    from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPConnectorMetadata
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector._source_tokens_enabled = True
+    connector._source_token_stats = SimpleNamespace(data={})
+    tracker = SimpleNamespace(
+        source_allocation_id="new", source_tokens=TokenConsumptionLedger(
+            [(0, 512, "local_cpu")], 16, 511
+        ), source_loaded_tokens=TokenConsumptionLedger(
+            [(0, 512, "local_cpu")], 0, 512
+        ), allocated_block_ids={0: [7]},
+    )
+    connector.request_trackers = {"req": tracker}
+    frame = LMCacheMPConnectorMetadata()
+    frame.source_allocations = {"req": "old" if old_frame else "new"}
+    output = SimpleNamespace(finished_recving={"req"}, invalid_block_ids={7} if invalid else set())
+    connector.on_model_step_completed_with_metadata("req", 511, frame, output)
+    counts = dict(connector._source_token_stats.data.get("reused", {}))
+    assert counts == ({} if old_frame or invalid else {"local_cpu": 495})
+    connector.on_model_step_completed_with_metadata("req", 511, frame, output)
+    assert connector._source_token_stats.data.get("reused", {}) == counts
+    # Cancellation removes the tracker; a late completion cannot recreate it.
+    connector.request_trackers.clear()
+    connector.on_model_step_completed_with_metadata("req", 511, frame, output)
+    assert connector._source_token_stats.data.get("reused", {}) == counts
