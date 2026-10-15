@@ -1,0 +1,146 @@
+{
+  "release": "SP6",
+  "date": "2026-10-15",
+  "platform": "linux/amd64",
+  "image": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp6",
+  "digest": "sha256:b1b466e9eea3057e88716a9a7d9df1130968f49b8ae94917be49407991794c1e",
+  "promoted_from": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp5-async-20261015-c3",
+  "promotion": "Byte-identical alias of validated c3; no rebuild. Original SP3, SP4, SP5 and c3 tags remain unchanged.",
+  "base_image": {
+    "reference": "intellif.io/dynamo/vllm-runtime:1.4.0-mooncake-0.3.12-lmcache-0.5.5-cuda13-sp5",
+    "digest": "sha256:620a26047f46fa6d3e323ac66f13f74ab6c2716f8fdf7ef92b4bd2ba17c39557"
+  },
+  "source_commits": {
+    "lmcache": {
+      "repository": "https://github.com/wukehu/LMCache.git",
+      "branch": "feature-sp3-source-token-consumption",
+      "commit": "7893eeacb594741d5be40a591e1d7d71d28a9696"
+    },
+    "vllm": {
+      "repository": "https://github.com/wukehu/vllm.git",
+      "branch": "feature-sp3-source-token-consumption",
+      "commit": "f29258b9912686f792489a6069848016386489d3"
+    }
+  },
+  "inherited_dynamo": {
+    "repository": "http://192.168.70.8/aiinfrastack/dynamo-custom.git",
+    "commit": "61c27e38cbfc45852ca288dfaa85edcd66ff4def",
+    "source_release_tag": "runtime-sp3-20261013"
+  },
+  "inherited_versions": {
+    "dynamo": "1.4.0",
+    "vllm": "0.26.0",
+    "lmcache": "0.5.5",
+    "mooncake-transfer-engine-cuda13": "0.3.12",
+    "torch": "2.11.0+cu130",
+    "CUDA": "13.0",
+    "rustc": "1.96.1",
+    "maturin": "1.14.1",
+    "cmake": "3.31.6",
+    "ninja": "1.13.0"
+  },
+  "inherited_native_dependencies": {
+    "cutlass": {
+      "repository": "https://github.com/NVIDIA/cutlass.git",
+      "tag_hint": "v4.4.2",
+      "commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2"
+    },
+    "cargo_lock_sha256": {
+      "Cargo.lock": "3d09ce734fef4e848e8f4f7fcd5b2bc2bbe6a2b408ef306b6870f0da39656e81",
+      "rust-toolchain.toml": "6791dcb04edcb490caaf08590dbe1dd9d9954b46dab2095df12dc984f704f1a8",
+      "lib/bindings/python/pyproject.toml": "60bb13d3304a29b012a2593d192034194e3c07ea336ace7944c34d2525cf7d54"
+    },
+    "cuda_architectures": [
+      "75",
+      "80",
+      "86",
+      "89",
+      "90",
+      "100",
+      "120"
+    ],
+    "vllm_target": "_C_stable_libtorch",
+    "max_parallel_jobs_per_component": 8,
+    "stage_timeout_seconds": 1800,
+    "repository_shipped_fatbins": {
+      "lib/llm/src/block_manager/block/transfer/kernels/vectorized_copy.fatbin": {
+        "sha256": "b2119000573efab28d15b7fddd9a48816ad545e199ec821e9092dd0bd69c1508",
+        "recompiled": false,
+        "scope": "unchanged committed binary input, distinct from custom discovery Rust code"
+      }
+    }
+  },
+  "source_release_tag": "runtime-sp6-20261015",
+  "changes": [
+    "Attribute asynchronous completed model frames using original connector metadata and allocation IDs.",
+    "Require successful load and successful model-step execution before counting external reused tokens; discard stale allocations, cancelled, discarded or invalid-load frames.",
+    "Route contextual completion metadata through MultiConnector while preserving legacy callback compatibility.",
+    "Enable source-token attribution by default for supported configurations; explicit unsupported opt-in fails, implicit unsupported default disables only attribution.",
+    "Preserve SP5 CUDA IPC context binding and all inherited SP4/SP3 transfer, discovery, W8A8 and RMSNorm customizations."
+  ],
+  "supported_scope": "PP1, non-speculative full attention, one KV group, DCP=PCP=1. Async scheduling stays enabled.",
+  "validation": {
+    "source_hashes": 14,
+    "cpu": {
+      "vllm_unique_cases": 20,
+      "lmcache_selected_cases": 19,
+      "evidence": "2026-10-15 targeted baseline and follow-up CPU runs; not rerun at promotion"
+    },
+    "gpu_single": {
+      "environment": "11.40 A800, Dynamo Qwen3-0.6B TP1 PP1 async",
+      "all_tiers": true,
+      "external_first_retrieve_each_layer": {
+        "loaded_tokens": 512,
+        "actual_reused_tokens": 511
+      },
+      "exact_final_control_deltas": {
+        "loaded": 1552.0,
+        "reused": 1548.0,
+        "native": 496.0,
+        "computed": 516.0,
+        "external": 1548.0,
+        "input": 2560,
+        "sources": {
+          "local_cpu": 511.0,
+          "local_disk": 511.0,
+          "remote_store": 526.0
+        }
+      },
+      "requests": 13,
+      "retained_request_proofs": 11,
+      "cleanup": "complete; 16 GPUs free after validation"
+    },
+    "same_node_dual_mp": {
+      "environment": "11.40 Qwen3-0.6B TP2 PP1 async, two MP processes",
+      "engine_loaded_delta": 8192,
+      "engine_reused_delta": 8192,
+      "engine_external_delta": 8192,
+      "both_mp_real_retrieve": true,
+      "scope": "earlier c3 validation; not a new cross-node test"
+    },
+    "tp16": "1064 c3 async startup and cold inference smoke passed; no TP16 external reuse or long stability acceptance claimed",
+    "final_image": "Pinned manifest, completion hook and native imports verified on remote builder at promotion; prior runtime image digest matched c3."
+  },
+  "known_limits": [
+    "PP > 1 excluded from acceptance; existing separate work preserved.",
+    "Cold-compute versus cached-output numerical consistency remains unresolved.",
+    "Speculative, mixed KV groups, DCP/PCP and general async cross-node cache acceptance not claimed.",
+    "L2/L3 controls use existing legacy lock mode; this validation does not revalidate leases beyond TTL.",
+    "No long-duration stability, SLO or TP16 cache stress acceptance.",
+    "Grafana new MP counters may miss the first observed positive sample; sampled-window extrapolation differs across counters and percentages are not exact request-cohort accounting."
+  ],
+  "dashboard": {
+    "uid": "lmcache-native-metrics-pp1",
+    "version": 14,
+    "frozen": true,
+    "updated_at_release": false
+  },
+  "build": {
+    "recipe": "Dockerfile",
+    "verification": "verify.py",
+    "runtime_manifest": "manifest.json",
+    "native_compilation": false,
+    "recipe_context": "Export changed_files in manifest.json from their pinned source commits retaining repository-relative paths. Copy Dockerfile, manifest.json and verify.py to context root. Build linux/amd64 against pinned SP5 base. Equivalent overlay contents are reproducible; byte-identical rebuilt OCI digest is not guaranteed.",
+    "embedded_manifest_note": "Embedded /opt/intellif/releases/sp5-async-c3 manifest source_state and image label record the original c3 build. SP6 is an alias; this external release.json and Git release tag fix final source commits without changing image bytes."
+  }
+}

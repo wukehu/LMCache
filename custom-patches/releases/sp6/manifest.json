@@ -1,0 +1,75 @@
+{
+  "release": "SP5 async source candidate c3",
+  "base": "intellif.io/dynamo/vllm-runtime@sha256:620a26047f46fa6d3e323ac66f13f74ab6c2716f8fdf7ef92b4bd2ba17c39557",
+  "files": [
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_connector.py",
+      "sha256": "6b465f1f660529ccc217db358a5752024b88ce9f7e817cdcccd0d41ccae822f1"
+    },
+    {
+      "path": "lmcache/integration/vllm/lmcache_mp_metadata.py",
+      "sha256": "b4228944ab6988835c914af9f7d4c56cc373a42b435eaa732899d1d253c2dddd"
+    },
+    {
+      "path": "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+      "sha256": "a3f3a246a933761f799503f9664d1848334374936d45ebf60950d58b62f38e0d"
+    },
+    {
+      "path": "lmcache/v1/mp_observability/source_attribution.py",
+      "sha256": "b15e4721397e1b039acb85130adbc78eab77a35ac17036f534b5647fcedcbf6d"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/modules/lookup.py",
+      "sha256": "64244d6896991920cbe877e6156aba8795ed443695412bd1fcba1df1286005bb"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/base.py",
+      "sha256": "58573820bf7708eed1e12f306cac6b09b0c262ebe3f030e304b59352630796b6"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/protocols/engine.py",
+      "sha256": "885382b499e95c3a4bc45bc4547ff931151a3255b01e78fb31c6290dcbb0ff2a"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/base.py",
+      "sha256": "b59bdacd2a38078fd8e4e8992da002526543af9ccea5da575866a98f0db85b82"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/client.py",
+      "sha256": "2374fe40c123d91bfc46929f04f688c73277a43c6a5c284e2406ff836e153973"
+    },
+    {
+      "path": "lmcache/v1/multiprocess/transport/zmq_impl/server.py",
+      "sha256": "1321b6153bf7da13dfd2b0a01f0f7628c0a75b732311090f18b0525a3f183526"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "sha256": "c50f427fa2be2493b97af5f53c209ffe0c8b947017c9f4e95fb3cc9efa2d2f54"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "sha256": "11323cdcc2f7e66101539aaa01ca85c74defc7ee1423283ea28532cb1f2713fa"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "sha256": "f0b3d80faff756fe7f4f59ab4543d7b3ea4c1aaee2689c7695cedd7429708ded"
+    },
+    {
+      "path": "lmcache/v1/platform/cuda/ipc_wrapper.py",
+      "sha256": "ed2d4332f731e747322b8a497bf5791cf79d7034b6780ea601c95f8bf8b76330"
+    }
+  ],
+  "source_state": "uncommitted, SHA256-pinned",
+  "excluded": [
+    "PP > 1 acceptance",
+    "numerical consistency"
+  ],
+  "changed_files": [
+    "lmcache/v1/mp_observability/source_attribution.py",
+    "lmcache/integration/vllm/lmcache_mp_metadata.py",
+    "lmcache/integration/vllm/lmcache_mp_connector.py",
+    "vllm/v1/core/sched/scheduler.py",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+    "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py"
+  ]
+}
