@@ -291,9 +291,15 @@ class SourceLedger:
     def loaded(
         self, adapter: int, backend: str, objects: Iterable[tuple[Hashable, int]]
     ) -> None:
-        """Record only successful L2 load results, once per object in this attempt."""
+        """Record successful loads once, preferring explicit source mappings.
+
+        P2P has an unambiguous peer origin even when discovery changes its
+        adapter ID. Other undeclared storage media remain unknown.
+        """
         source = Source(
-            self._mapping.get(f"l2:{adapter}", "unknown"),
+            self._mapping.get(
+                f"l2:{adapter}", "peer" if backend == "p2p" else "unknown"
+            ),
             "l2",
             backend,
             str(adapter),
